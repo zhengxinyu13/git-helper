@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 打包产物（exe 体积大，不进仓库；重新打包跑 build_exe.py 即可）
+dist/
+build/
+*.spec
+
+# 本机运行配置（含绝对路径）与日志
+config.json
+error.log
+debug.log

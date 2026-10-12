@@ -31,19 +31,29 @@ def _res_dir():
     return base or os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_self_dir(d):
+    """这个目录是不是「Git 提交助手自己的源码目录」。
+
+    助手现在可以整个搬离工作区（比如放到 ~/Desktop/git-helper 并自建仓库），
+    这时往上找仓库会先撞见它自己 —— 得跳过，否则默认仓库变成助手源码而不是用户的工作区。
+    """
+    if os.path.isfile(os.path.join(d, "gitcore.py")):
+        return True
+    return os.path.basename(d) == "git-helper"
+
+
 def _guess_default_repo():
     """没配置过仓库时用哪个目录。
 
-    源码模式：git-helper/ 的上一级（就是工作区本身）。
-    exe 模式：从 exe 所在目录往上找最近的 Git 仓库，最多找 5 层 ——
-             这样 exe 放在 git-helper/dist/ 或工作区任意子目录都能认出来；
-             找不到就用 exe 所在目录，让用户手动选一次。
+    从起点往上找最近的 Git 仓库，最多找 5 层 ——
+    这样 exe 放在 git-helper/dist/ 或工作区任意子目录都能认出来；
+    遇到助手自己的目录就跳过；找不到就回落到起点，让用户手动选一次。
+
+    起点：源码模式是 git-helper/ 的上一级（工作区），exe 模式是 exe 所在目录。
     """
-    if not getattr(sys, "frozen", False):
-        return os.path.dirname(HERE)
-    d = HERE
+    d = os.path.dirname(HERE) if not getattr(sys, "frozen", False) else HERE
     for _ in range(5):
-        if os.path.isdir(os.path.join(d, ".git")):
+        if os.path.isdir(os.path.join(d, ".git")) and not _is_self_dir(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:

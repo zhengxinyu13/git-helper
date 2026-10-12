@@ -5,6 +5,9 @@ __pycache__/
 dist/
 build/
 *.spec
+# Inno Setup 编译出来的安装包（installer.iss 脚本本身要入库）
+# 注意：.gitignore 不支持行内 # 注释，注释必须独占一行
+installer/
 
 # 本机运行配置（含绝对路径）与日志
 config.json

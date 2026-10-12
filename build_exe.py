@@ -34,14 +34,18 @@ COMMON = [
     "--exclude-module", "tkinter",
 ]
 
+# 第三个元素是 extra 参数。
+# CLI 版只在「不带参数且非冻结」时才会 import gui_qt，打包成 exe 后走的是
+# 纯命令行分支，所以整包排除 PyQt6 —— 体积能从 34MB 降到 ~10MB。
 TARGETS = [
-    ("Git提交助手", "gui_main.py", True),     # GUI：无控制台
-    ("GitHelper-CLI", "git_helper.py", False),  # CLI：保留控制台
+    ("Git提交助手", "gui_main.py", True, []),   # GUI：无控制台
+    ("GitHelper-CLI", "git_helper.py", False,
+     ["--exclude-module", "PyQt6"]),            # CLI：保留控制台，不带 Qt
 ]
 
 
-def run(name, script, windowed):
-    cmd = list(COMMON) + ["--name", name]
+def run(name, script, windowed, extra=()):
+    cmd = list(COMMON) + list(extra) + ["--name", name]
     cmd += ["--windowed" if windowed else "--console"]
     cmd += [os.path.join(HERE, script)]
     print("\n>>> 打包 %s（%s）" % (name, script))
@@ -79,8 +83,8 @@ def main():
         print("已保留 %s" % fn)
 
     ok = True
-    for name, script, windowed in TARGETS:
-        ok = run(name, script, windowed) and ok
+    for name, script, windowed, extra in TARGETS:
+        ok = run(name, script, windowed, extra) and ok
 
     print("\n==== 产物 ====")
     dist = os.path.join(HERE, "dist")

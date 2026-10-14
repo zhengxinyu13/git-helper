@@ -18,8 +18,9 @@ from PyQt6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient,
                          QIcon, QFontDatabase)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QComboBox, QFileDialog, QFrame, QGraphicsBlurEffect,
-                             QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+                             QComboBox, QDialog, QFileDialog, QFrame,
+                             QGraphicsBlurEffect,
+                             QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QSizeGrip,
                              QSplitter, QTableWidget, QTableWidgetItem,
                              QTextEdit, QVBoxLayout, QWidget)
@@ -174,6 +175,16 @@ QScrollBar::handle:horizontal {{
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
 QCheckBox {{ background: transparent; spacing: 6px; }}
+
+/* ---- 自绘提示框（见 GlassDialog）：跟随主界面主题，不吃系统深色模式 ---- */
+QFrame#dlgCard {{ background: transparent; border: none; }}
+QLabel#dlgTitle {{ color: {text}; font-size: 11pt; font-weight: bold; }}
+QLabel#dlgText {{ color: {text}; }}
+QPushButton#dlgClose {{
+    background: transparent; border: none; border-radius: 9px; padding: 0px;
+    color: {muted}; font-size: 11pt;
+}}
+QPushButton#dlgClose:hover {{ background: #e81123; color: #ffffff; }}
 """
 
 
@@ -233,6 +244,284 @@ def make_blurred(src: QPixmap, radius=26) -> QPixmap:
         return holder.grab()
     except Exception:
         return src
+
+
+# ---------------------------------------------------------------- 提示框
+# 为什么不用 QMessageBox：它是系统原生窗口，会跟随 Windows 的深色模式，
+# 出现「深底 + 深字」完全看不清的情况（用户反馈过），而且方角、带系统标题栏，
+# 跟主界面的浅色玻璃主题完全不搭。这里自绘一套同主题的对话框顶上去。
+DIALOG_MARGIN = 16        # 四周留给外阴影的空白
+DIALOG_RADIUS = 16        # 卡片圆角
+DIALOG_TEXT_W = 520       # 正文最大宽度，超过就换行
+
+
+class GlassDialog(QDialog):
+    """与主界面同主题的提示框：无边框 + 圆角浅色卡片 + 柔和外阴影。
+
+    渲染规则必须和 GlassWindow 一致（见其 render_glass 注释）：
+    顶层半透明窗口的 QPainter 只能做一次 drawPixmap，path / clip / 渐变
+    一律离屏预渲染，否则会直接卡死进程且不留任何日志。
+    """
+
+    ICON = {"info": ("i", "#2f7fd6"),
+            "warn": ("!", "#d07b1e"),
+            "error": ("×", "#cf4436"),
+            "ask": ("?", "#3b6fd4")}
+
+    def __init__(self, parent, title, text, kind="info",
+                 buttons=(("ok", "确定", True),), field=None,
+                 default_value=""):
+        super().__init__(parent)
+        self._drag = None
+        self._frame = None
+        self.result_key = None
+        self.input = None                 # QLineEdit 或 QComboBox
+
+        self.setWindowFlags(Qt.WindowType.Dialog |
+                            Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self.setWindowTitle(title)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(DIALOG_MARGIN, DIALOG_MARGIN,
+                                 DIALOG_MARGIN, DIALOG_MARGIN)
+        card = QFrame()
+        card.setObjectName("dlgCard")     # 背景由自绘 pixmap 提供，这里必须透明
+        outer.addWidget(card)
+
+        body = QVBoxLayout(card)
+        body.setContentsMargins(22, 18, 22, 16)
+        body.setSpacing(14)
+
+        # 顶部一行：圆形图标 + 标题 + 关闭按钮
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        glyph, color = self.ICON.get(kind, self.ICON["info"])
+        ic = QLabel(glyph)
+        ic.setFixedSize(30, 30)
+        ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ic.setStyleSheet("background:%s; color:#ffffff; border-radius:15px;"
+                         "font-size:14pt; font-weight:bold;" % color)
+        head.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+        lb_title = QLabel(title)
+        lb_title.setObjectName("dlgTitle")
+        head.addWidget(lb_title, 1, Qt.AlignmentFlag.AlignVCenter)
+        btn_close = QPushButton("✕")
+        btn_close.setObjectName("dlgClose")
+        btn_close.setFixedSize(28, 28)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(lambda: self._done("cancel"))
+        head.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignTop)
+        body.addLayout(head)
+
+        lb_text = QLabel(text)
+        lb_text.setObjectName("dlgText")
+        lb_text.setWordWrap(True)
+        lb_text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lb_text.setMinimumWidth(290)
+        lb_text.setMaximumWidth(DIALOG_TEXT_W)
+        body.addWidget(lb_text)
+
+        if field == "text":
+            self.input = QLineEdit(default_value)
+            self.input.setMinimumWidth(330)
+            self.input.returnPressed.connect(lambda: self._done("ok"))
+            body.addWidget(self.input)
+        elif isinstance(field, (tuple, list)) and len(field) >= 2:
+            self.input = QComboBox()
+            self.input.addItems([str(x) for x in field[1]])
+            cur = int(field[2]) if len(field) > 2 else 0
+            if 0 <= cur < self.input.count():
+                self.input.setCurrentIndex(cur)
+            self.input.setMinimumWidth(330)
+            body.addWidget(self.input)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch(1)
+        for key, label, accent in buttons:
+            b = QPushButton(label)
+            if accent:
+                b.setProperty("accent", True)
+                b.setDefault(True)
+            b.setMinimumSize(88, 32)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self._done(k))
+            row.addWidget(b)
+        body.addLayout(row)
+
+        self.adjustSize()
+        self._center_on_parent()
+        self._build_frame()
+        if self.input is not None:
+            QTimer.singleShot(0, self.input.setFocus)
+
+    # ------------------------------------------------------------ 渲染
+    def _build_frame(self):
+        """离屏预渲染：外阴影 + 圆角浅色卡片 + 两道描边。"""
+        W, H = max(1, self.width()), max(1, self.height())
+        inner = QRect(DIALOG_MARGIN, DIALOG_MARGIN,
+                      max(1, W - DIALOG_MARGIN * 2),
+                      max(1, H - DIALOG_MARGIN * 2))
+        fm = QPixmap(W, H)
+        fm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(fm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # 外阴影（QRect.adjusted 只接受 int —— 传 float 会抛 TypeError 并杀进程）
+        for i in range(6, 0, -1):
+            pad = int(i * 2.0)
+            sp = QPainterPath()
+            sp.addRoundedRect(QRectF(inner.adjusted(-pad, -pad + 2, pad, pad)),
+                              float(DIALOG_RADIUS + pad),
+                              float(DIALOG_RADIUS + pad))
+            p.fillPath(sp, QColor(17, 23, 38, 3 + i * 3))
+
+        # 卡片底：浅色近乎不透明，保证任何壁纸下文字都清晰
+        card = QPainterPath()
+        card.addRoundedRect(QRectF(inner), float(DIALOG_RADIUS),
+                            float(DIALOG_RADIUS))
+        p.fillPath(card, QColor(249, 251, 255, 252))
+
+        # 描边两道：外侧淡灰（浅底上也看得出轮廓）+ 内侧白高光
+        op = QPainterPath()
+        op.addRoundedRect(QRectF(inner.adjusted(-1, -1, 1, 1)),
+                          float(DIALOG_RADIUS + 1), float(DIALOG_RADIUS + 1))
+        p.setPen(QPen(QColor(118, 130, 156, 90), 1))
+        p.drawPath(op)
+        p.setPen(QPen(QColor(255, 255, 255, 240), 1))
+        p.drawPath(card)
+        p.end()
+        self._frame = fm
+
+    def paintEvent(self, event):
+        """只贴一张预渲染好的位图（规则同 GlassWindow）。"""
+        f = self._frame
+        if f is None or f.isNull():
+            return super().paintEvent(event)
+        p = QPainter(self)
+        p.drawPixmap(0, 0, f)
+        p.end()
+
+    # ------------------------------------------------------------ 交互
+    def _center_on_parent(self):
+        par = self.parentWidget()
+        if par is not None and par.isVisible():
+            c = par.frameGeometry().center()
+        else:
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return
+            c = scr.availableGeometry().center()
+        self.move(c.x() - self.width() // 2, c.y() - self.height() // 2)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = (event.globalPosition().toPoint() -
+                          self.frameGeometry().topLeft())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None and (event.buttons() &
+                                       Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._done("cancel")
+            return
+        super().keyPressEvent(event)
+
+    def _done(self, key):
+        self.result_key = key
+        if key == "ok":
+            self.accept()
+        else:
+            self.reject()
+
+    def value(self):
+        if self.input is None:
+            return ""
+        if isinstance(self.input, QComboBox):
+            return self.input.currentText()
+        return self.input.text()
+
+    def run(self):
+        """模态执行，返回被点的按钮 key（ok / cancel），取消或异常为 None。"""
+        self.exec()
+        return self.result_key
+
+
+class Msg:
+    """统一的提示框入口。
+
+    方法名刻意与 QMessageBox / QInputDialog 保持同名同义，这样原来的调用点
+    只需把类名换掉即可 —— 尤其 question() 返回 QMessageBox.StandardButton，
+    调用点的「!= QMessageBox.StandardButton.Yes」一个字都不用改。
+    """
+
+    @staticmethod
+    def _show(parent, title, text, kind, buttons,
+              field=None, default_value=""):
+        try:
+            d = GlassDialog(parent, title, text, kind=kind, buttons=buttons,
+                            field=field, default_value=default_value)
+            return d.run(), d
+        except Exception:
+            # 自绘失败就用原生兜底，至少别让用户什么都看不到
+            # （这里必须显式写 QMessageBox，写成 Msg.* 会无限递归）
+            log_exception(*sys.exc_info())
+            try:
+                QMessageBox.information(parent, title, text)
+            except Exception:
+                pass
+            return None, None
+
+    @staticmethod
+    def information(parent, title, text):
+        Msg._show(parent, title, text, "info", (("ok", "确定", True),))
+
+    @staticmethod
+    def warning(parent, title, text):
+        Msg._show(parent, title, text, "warn", (("ok", "确定", True),))
+
+    @staticmethod
+    def critical(parent, title, text):
+        Msg._show(parent, title, text, "error", (("ok", "确定", True),))
+
+    @staticmethod
+    def question(parent, title, text, ok_text="确定", cancel_text="取消"):
+        """返回 QMessageBox.StandardButton，与原生 question() 行为一致。"""
+        key, _d = Msg._show(parent, title, text, "ask",
+                            (("ok", ok_text, True), ("cancel", cancel_text, False)))
+        if key == "ok":
+            return QMessageBox.StandardButton.Yes
+        return QMessageBox.StandardButton.No
+
+    @staticmethod
+    def getText(parent, title, label, ok_text="确定", cancel_text="取消"):
+        key, d = Msg._show(parent, title, label, "ask",
+                           (("ok", ok_text, True), ("cancel", cancel_text, False)),
+                           field="text")
+        if key == "ok" and d is not None:
+            return d.value(), True
+        return "", False
+
+    @staticmethod
+    def getItem(parent, title, label, items, current=0, editable=False):
+        key, d = Msg._show(parent, title, label, "ask",
+                           (("ok", "确定", True), ("cancel", "取消", False)),
+                           field=("choice", list(items), current))
+        if key == "ok" and d is not None:
+            return d.value(), True
+        return "", False
 
 
 class GlassWindow(QWidget):
@@ -844,7 +1133,7 @@ class GlassWindow(QWidget):
         path = os.path.normpath(self.ed_repo.text().strip().strip('"'))
         self.ed_repo.setText(path)
         if not os.path.isdir(path):
-            QMessageBox.warning(self, "路径无效",
+            Msg.warning(self, "路径无效",
                                 "目录不存在：\n%s\n\n点「初始化此目录并首次提交」可以创建它。" % path)
             return
         self.repo = path
@@ -862,16 +1151,16 @@ class GlassWindow(QWidget):
     def init_current(self):
         path = os.path.normpath(self.ed_repo.text().strip().strip('"'))
         if not path:
-            QMessageBox.information(self, "提示", "先填或浏览一个文件夹路径。")
+            Msg.information(self, "提示", "先填或浏览一个文件夹路径。")
             return
         if not os.path.isdir(path):
-            if QMessageBox.question(self, "目录不存在", "目录不存在：\n%s\n\n要创建它吗？" % path) \
+            if Msg.question(self, "目录不存在", "目录不存在：\n%s\n\n要创建它吗？" % path) \
                     != QMessageBox.StandardButton.Yes:
                 return
         if is_repo(path):
-            QMessageBox.information(self, "提示", "已经是 Git 仓库了，无需初始化。")
+            Msg.information(self, "提示", "已经是 Git 仓库了，无需初始化。")
             return
-        if QMessageBox.question(
+        if Msg.question(
                 self, "确认初始化",
                 "将在下面这个目录执行 git init，并把现有文件全部纳入首次提交：\n\n%s" % path) \
                 != QMessageBox.StandardButton.Yes:
@@ -879,13 +1168,13 @@ class GlassWindow(QWidget):
         try:
             ok, msg = init_repo(path)
         except Exception as e:
-            QMessageBox.critical(self, "初始化失败", str(e))
+            Msg.critical(self, "初始化失败", str(e))
             return
         self.repo = path
         self.ed_repo.setText(path)
         remember_repo(self.cfg, path)
         self.update_recent()
-        QMessageBox.information(self, "完成", msg)
+        Msg.information(self, "完成", msg)
         self.set_status(msg)
         self.refresh()
 
@@ -898,20 +1187,20 @@ class GlassWindow(QWidget):
     # ------------------------------------------------------------ 分支
     def _need_repo(self):
         if not is_repo(self.repo):
-            QMessageBox.warning(self, "提示", "当前目录不是 Git 仓库：\n%s" % self.repo)
+            Msg.warning(self, "提示", "当前目录不是 Git 仓库：\n%s" % self.repo)
             return False
         return True
 
     def do_create_branch(self):
         if not self._need_repo():
             return
-        name, ok = QInputDialog.getText(self, "新建分支", "分支名：")
+        name, ok = Msg.getText(self, "新建分支", "分支名：")
         if not ok or not name.strip():
             return
         try:
             msg = create_branch(self.repo, name.strip(), switch=True)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status(msg)
         self.refresh()
@@ -921,12 +1210,12 @@ class GlassWindow(QWidget):
             return
         name = self.cb_branch.currentText()
         if not name:
-            QMessageBox.information(self, "提示", "先在下拉框里选一个分支。")
+            Msg.information(self, "提示", "先在下拉框里选一个分支。")
             return
         try:
             msg = switch_branch(self.repo, name)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status(msg)
         self.refresh()
@@ -937,26 +1226,26 @@ class GlassWindow(QWidget):
         src = self.cb_branch.currentText()
         cur = next((b["name"] for b in self.branches if b["current"]), "")
         if not src:
-            QMessageBox.information(self, "提示", "先在下拉框里选要合并进来的分支。")
+            Msg.information(self, "提示", "先在下拉框里选要合并进来的分支。")
             return
         if src == cur:
-            QMessageBox.information(self, "提示", "不能把分支合并到它自己。")
+            Msg.information(self, "提示", "不能把分支合并到它自己。")
             return
-        if QMessageBox.question(self, "确认合并",
+        if Msg.question(self, "确认合并",
                                 "把「%s」合并进当前分支「%s」？" % (src, cur)) \
                 != QMessageBox.StandardButton.Yes:
             return
         try:
             r = merge_branch(self.repo, src)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         if r["merged"]:
-            QMessageBox.information(self, "合并完成", r["message"])
+            Msg.information(self, "合并完成", r["message"])
             self.set_status("已合并 %s → %s" % (src, cur))
         else:
             cf = r["conflicts"]
-            QMessageBox.warning(
+            Msg.warning(
                 self, "合并有冲突",
                 "合并未完成，需要手动解决冲突：\n\n%s\n\n解决后提交，或点「中止合并」回到合并前。"
                 % ("\n".join(cf) if cf else r["message"]))
@@ -969,21 +1258,21 @@ class GlassWindow(QWidget):
         name = self.cb_branch.currentText()
         if not name:
             return
-        if QMessageBox.question(self, "确认删除",
+        if Msg.question(self, "确认删除",
                                 "删除分支「%s」？\n未合并的改动会丢失，建议先合并。" % name) \
                 != QMessageBox.StandardButton.Yes:
             return
         try:
             msg = delete_branch(self.repo, name)
         except Exception as e:
-            if QMessageBox.question(self, "删除失败",
+            if Msg.question(self, "删除失败",
                                     "%s\n\n有未合并的改动。要强制删除吗？" % e) \
                     != QMessageBox.StandardButton.Yes:
                 return
             try:
                 msg = delete_branch(self.repo, name, force=True)
             except Exception as e2:
-                QMessageBox.critical(self, "失败", str(e2))
+                Msg.critical(self, "失败", str(e2))
                 return
         self.set_status(msg)
         self.refresh()
@@ -994,7 +1283,7 @@ class GlassWindow(QWidget):
         try:
             msg = abort_merge(self.repo)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status(msg)
         self.refresh()
@@ -1088,14 +1377,14 @@ class GlassWindow(QWidget):
         try:
             h, msg = do_commit(self.repo, self.ed_msg.text(), paths or None)
         except Exception as e:
-            QMessageBox.critical(self, "提交失败", str(e))
+            Msg.critical(self, "提交失败", str(e))
             return
         if h:
             self.ed_msg.clear()
             self.set_status("已提交 %s：%s" % (h[:7], msg))
         else:
             self.set_status(msg)
-            QMessageBox.information(self, "无需提交", msg)
+            Msg.information(self, "无需提交", msg)
         self.refresh()
 
     def sel_all(self):
@@ -1107,9 +1396,9 @@ class GlassWindow(QWidget):
     def restore_selected(self):
         paths = self.selected_paths()
         if not paths:
-            QMessageBox.information(self, "提示", "先在上方列表中选中要还原的文件。")
+            Msg.information(self, "提示", "先在上方列表中选中要还原的文件。")
             return
-        if QMessageBox.question(
+        if Msg.question(
                 self, "确认还原",
                 "把选中的 %d 个文件还原到最近一次提交的状态？\n未保存的改动会丢失。\n\n%s"
                 % (len(paths), "\n".join(paths[:12]))) != QMessageBox.StandardButton.Yes:
@@ -1119,7 +1408,7 @@ class GlassWindow(QWidget):
             try:
                 restore_file(self.repo, p)
             except Exception as e:
-                QMessageBox.critical(self, "还原失败", "%s\n%s" % (p, e))
+                Msg.critical(self, "还原失败", "%s\n%s" % (p, e))
                 break
         self.set_status("已还原 %d 个文件（备份分支：%s）" % (len(paths), backup or "无"))
         self.refresh()
@@ -1127,19 +1416,19 @@ class GlassWindow(QWidget):
     def discard_all(self):
         if not self._need_repo():
             return
-        if QMessageBox.question(
+        if Msg.question(
                 self, "⚠️ 危险操作",
                 "此操作非常危险，可能导致不可逆的数据丢失！\n\n"
                 "将丢弃工作区所有未提交的改动，并删除所有未跟踪的新文件。\n"
                 "系统会先创建一个备份分支。\n\n确定继续？") != QMessageBox.StandardButton.Yes:
             return
-        if QMessageBox.question(self, "再次确认", "真的要丢弃全部未提交改动吗？") \
+        if Msg.question(self, "再次确认", "真的要丢弃全部未提交改动吗？") \
                 != QMessageBox.StandardButton.Yes:
             return
         try:
             backup = discard_all(self.repo)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status("已撤销全部未提交改动（备份分支：%s）" % (backup or "无"))
         self.refresh()
@@ -1147,25 +1436,25 @@ class GlassWindow(QWidget):
     def show_commit_diff(self):
         h = self.sel_hash()
         if not h:
-            QMessageBox.information(self, "提示", "先在历史列表里选中一次提交。")
+            Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
         try:
             self.set_diff(get_diff(self.repo, "commit", h))
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
 
     def show_diff(self, kind):
         try:
             self.set_diff(get_diff(self.repo, kind))
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
 
     def revert_commit(self):
         h = self.sel_hash()
         if not h:
-            QMessageBox.information(self, "提示", "先在历史列表里选中一次提交。")
+            Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
-        if QMessageBox.question(
+        if Msg.question(
                 self, "反向撤销",
                 "生成一次「反向提交」来抵消 %s 的改动。\n历史记录完整保留，可再次撤销。\n\n继续？" % h[:7]) \
                 != QMessageBox.StandardButton.Yes:
@@ -1173,7 +1462,7 @@ class GlassWindow(QWidget):
         try:
             msg = revert_commit(self.repo, h)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status(msg)
         self.refresh()
@@ -1181,11 +1470,11 @@ class GlassWindow(QWidget):
     def reset_to_commit(self):
         h = self.sel_hash()
         if not h:
-            QMessageBox.information(self, "提示", "先在历史列表里选中一次提交。")
+            Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
         row = list({i.row() for i in self.tbl_log.selectedIndexes()})[0]
         subject = self.tbl_log.item(row, 1).text() if self.tbl_log.item(row, 1) else ""
-        if QMessageBox.question(
+        if Msg.question(
                 self, "⚠️ 回退确认",
                 "把 HEAD 直接回退到 %s：%s\n\n之后的提交记录会从当前分支移除。\n"
                 "系统会先创建备份分支，可随时恢复。\n\n确定继续？" % (h[:7], subject)) \
@@ -1194,14 +1483,14 @@ class GlassWindow(QWidget):
         items = ["soft  —— 改动保留在暂存区，可直接再提交",
                  "mixed —— 改动保留在工作区，需重新 add（默认）",
                  "hard  —— 丢弃全部改动，工作区彻底回到那次提交"]
-        mode, ok = QInputDialog.getItem(self, "选择回退模式", "回退模式：", items, 1, False)
+        mode, ok = Msg.getItem(self, "选择回退模式", "回退模式：", items, 1, False)
         if not ok:
             return
         mode = mode.split()[0]
         try:
             backup = reset_to(self.repo, h, mode)
         except Exception as e:
-            QMessageBox.critical(self, "失败", str(e))
+            Msg.critical(self, "失败", str(e))
             return
         self.set_status("已回退到 %s（%s，备份分支：%s）" % (h[:7], mode, backup or "无"))
         self.refresh()
@@ -1260,6 +1549,8 @@ def run_gui(repo=None):
         w.show()
         return app.exec()
     except Exception:
+        # 走到这里说明界面根本没起来，自绘对话框（依赖已经建好的窗口环境）
+        # 不可靠，所以刻意用原生对话框报错。
         log_exception(*sys.exc_info())
         QMessageBox.critical(
             None, "启动失败",

@@ -330,6 +330,19 @@ class GlassWindow(QWidget):
         pp = QPainter(pm)
         pp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        # 圆角裁剪：必须在画内容「之前」用 setClipPath 定好裁剪区。
+        #
+        # 坑（PyQt6 6.11 实测）：不要用 DestinationIn 合成模式去裁 ——
+        # `setCompositionMode(DestinationIn) + fillPath(圆角矩形)` 在 QPixmap 上
+        # 完全不生效（换成 ARGB32 格式、换成 QBrush 结果一样），四角会残留
+        # 「模糊桌面 + 白蒙版」，在深色壁纸上表现为窗口圆角外侧一块白透的小三角。
+        # setClipPath 在**离屏 pixmap** 上是好的；会卡死的是顶层半透明窗口的
+        # QPainter（见上方函数注释），两者别混。
+        if radius > 0:
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(0, 0, w, h), float(radius), float(radius))
+            pp.setClipPath(clip)
+
         # 底：模糊桌面，没有就用渐变
         if not self.backdrop.isNull():
             pp.drawPixmap(QRectF(0, 0, w, h), self.backdrop,
@@ -352,12 +365,6 @@ class GlassWindow(QWidget):
             pp.drawPixmap(QRectF(int(w * fx) - r, int(h * fy) - r, r * 2, r * 2),
                           blob, QRectF(blob.rect()))
 
-        # 圆角遮罩：DestinationIn 只保留圆角内，边缘带抗锯齿
-        if radius > 0:
-            mask = QPainterPath()
-            mask.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
-            pp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-            pp.fillPath(mask, QColor(0, 0, 0, 255))
         pp.end()
         return pm
 

@@ -7,7 +7,7 @@
 ;       脚本会在安装完成后检测，没装就弹提示（不阻断安装）。
 
 #define MyAppName "Git 提交助手"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "Grayson Zheng"
 #define MyAppExeName "Git提交助手.exe"
 #define MyCliExeName "GitHelper-CLI.exe"

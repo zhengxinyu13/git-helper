@@ -15,7 +15,7 @@
 #define MyAppId "{967E7D85-8020-42D6-8F0B-866FA354AB62}"
 
 [Setup]
-AppId={#MyAppId}
+AppId={{#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -152,12 +152,9 @@ begin
     '这台电脑上已经装有 {#MyAppName} ' + OldVersion + '，即将升级到 {#MyAppVersion}。' + #13#10 + #13#10 +
     '升级只替换程序文件：你的最近仓库记录、自动提交设置、玻璃浓度都会保留，' + #13#10 +
     '桌面和开始菜单的快捷方式也不会被删除或移动。';
-  WizardForm.ReadyLabel1.Caption :=
-    '安装程序已准备好，即将把 {#MyAppName} 升级到 {#MyAppVersion}。';
   WizardForm.FinishedHeadingLabel.Caption := '{#MyAppName} 升级完成';
-  WizardForm.FinishedLabelNoIcons.Caption :=
+  WizardForm.FinishedLabel.Caption :=
     '已升级到 {#MyAppVersion}。你的个人设置和快捷方式都原样保留。';
-  WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabelNoIcons.Caption;
 
   { 桌面快捷方式已经存在就把这个任务勾上：
     一是位置不会动（不会删掉重建），二是新的卸载记录里能记上它 }

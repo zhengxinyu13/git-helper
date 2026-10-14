@@ -32,10 +32,29 @@ from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      revert_commit, save_config, switch_branch)
 
 # ---------------------------------------------------------------- 配色
-BG_TINT = QColor(246, 249, 255, 118)      # 叠在模糊桌面上的白色蒙版（越透越有玻璃感）
-CARD_BG = "rgba(255, 255, 255, 0.42)"     # 卡片：真半透明，能透出背景
-CARD_BG_STRONG = "rgba(255, 255, 255, 0.72)"
 CARD_BORDER = "rgba(255, 255, 255, 0.85)"
+
+# ------------------------------------------------------- 玻璃浓度档位
+# 毛玻璃透得太多时，桌面壁纸的花纹会一路透到界面上，文字区域变花、看久了累眼。
+# 这里把「背景可见度」拆成一个档位，统一驱动四个参数，用户可按自己的壁纸选：
+#   tint  盖在模糊桌面上的白色蒙版不透明度（0-255），越大背景越淡
+#   blur  高斯模糊半径，越大背景细节越少
+#   card  卡片不透明度（0-1）
+#   field 输入框 / 下拉框 / 文本框
+#   btn   按钮；table 表格；head 表头
+#   glow  柔光强度系数（0-1），越沉越收敛
+GLASS_LEVELS = {
+    "通透": {"tint": 118, "blur": 26, "card": "0.42", "btn": "0.58",
+             "field": "0.60", "table": "0.38", "head": "0.32", "glow": 1.0},
+    "标准": {"tint": 172, "blur": 34, "card": "0.60", "btn": "0.72",
+             "field": "0.74", "table": "0.54", "head": "0.48", "glow": 0.8},
+    "沉稳": {"tint": 216, "blur": 44, "card": "0.76", "btn": "0.84",
+             "field": "0.86", "table": "0.70", "head": "0.64", "glow": 0.5},
+    "实底": {"tint": 246, "blur": 60, "card": "0.93", "btn": "0.96",
+             "field": "0.97", "table": "0.90", "head": "0.86", "glow": 0.2},
+}
+# 默认取「沉稳」：复杂桌面下不刺眼，同时还能看出背景轮廓，玻璃感仍在。
+DEFAULT_GLASS = "沉稳"
 TEXT = "#1f2937"
 MUTED = "#7b8494"
 ACCENT = "#3b6fd4"
@@ -49,7 +68,7 @@ SHADOW_MARGIN = 14       # 窗口四周留给阴影的空白
 CORNER = 18              # 窗口圆角
 BAR_H = 52               # 自绘标题栏高度
 
-QSS = """
+_QSS_TEMPLATE = """
 QWidget {{
     color: {text};
     font-family: "Microsoft YaHei UI";
@@ -78,7 +97,7 @@ QLabel#groupTitle {{
     font-weight: bold;
 }}
 QPushButton {{
-    background: rgba(255, 255, 255, 0.58);
+    background: {btn};
     border: 1px solid {border};
     border-radius: 9px;
     padding: 6px 14px;
@@ -106,7 +125,7 @@ QPushButton#winbtn {{
 QPushButton#winbtn:hover {{ background: rgba(255, 255, 255, 0.85); }}
 QPushButton#winbtnClose:hover {{ background: #e81123; color: #ffffff; }}
 QLineEdit, QComboBox, QTextEdit {{
-    background: rgba(255, 255, 255, 0.60);
+    background: {field};
     border: 1px solid {border};
     border-radius: 9px;
     padding: 6px 10px;
@@ -123,7 +142,7 @@ QComboBox QAbstractItemView {{
     selection-background-color: #dce8ff;
 }}
 QTableWidget {{
-    background: rgba(255, 255, 255, 0.38);
+    background: {table};
     border: none;
     border-radius: 12px;
     gridline-color: rgba(160, 170, 190, 0.25);
@@ -132,7 +151,7 @@ QTableWidget {{
 QTableWidget::item {{ padding: 5px 8px; }}
 QTableWidget::item:selected {{ background: rgba(220, 232, 255, 0.95); color: {text}; }}
 QHeaderView::section {{
-    background: rgba(255, 255, 255, 0.32);
+    background: {head};
     border: none;
     border-bottom: 1px solid rgba(160, 170, 190, 0.30);
     padding: 6px 8px;
@@ -155,8 +174,24 @@ QScrollBar::handle:horizontal {{
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
 QCheckBox {{ background: transparent; spacing: 6px; }}
-""".format(text=TEXT, muted=MUTED, accent=ACCENT, accent_hover=ACCENT_HOVER,
-           danger=DANGER, card=CARD_BG, border=CARD_BORDER)
+"""
+
+
+def build_qss(level=None):
+    """按玻璃浓度档位生成样式表。
+
+    卡片/按钮/输入框的透明度都跟着档位走，所以切档时必须重新 setStyleSheet 一次，
+    否则会出现「卡片变实了、按钮还是透的」这种不一致。
+    """
+    g = GLASS_LEVELS.get(level) or GLASS_LEVELS[DEFAULT_GLASS]
+    return _QSS_TEMPLATE.format(
+        text=TEXT, muted=MUTED, accent=ACCENT, accent_hover=ACCENT_HOVER,
+        danger=DANGER, border=CARD_BORDER,
+        card="rgba(255, 255, 255, %s)" % g["card"],
+        btn="rgba(255, 255, 255, %s)" % g["btn"],
+        field="rgba(255, 255, 255, %s)" % g["field"],
+        table="rgba(255, 255, 255, %s)" % g["table"],
+        head="rgba(255, 255, 255, %s)" % g["head"])
 
 
 _GLOW_CACHE = {}
@@ -212,6 +247,10 @@ class GlassWindow(QWidget):
         super().__init__()
         self.cfg = load_config()
         self.repo = repo or self.cfg.get("lastRepo") or DEFAULT_REPO
+        self.glass_name = self.cfg.get("glassLevel") or DEFAULT_GLASS
+        if self.glass_name not in GLASS_LEVELS:
+            self.glass_name = DEFAULT_GLASS
+        self.glass = GLASS_LEVELS[self.glass_name]
         self.files, self.logs, self.branches = [], [], []
         self.backdrop = QPixmap()
         self._frame = None                # 整窗离屏渲染缓存（阴影+玻璃+边框）
@@ -272,7 +311,7 @@ class GlassWindow(QWidget):
             if w <= 1 or h <= 1:
                 return
             crop = full.copy(QRect(x, y, w, h))
-            self.backdrop = make_blurred(crop, 26)
+            self.backdrop = make_blurred(crop, self.glass["blur"])
         except Exception:
             self.backdrop = QPixmap()
         self._rebuild_frame()             # 背景变了，整窗缓存重建
@@ -301,12 +340,13 @@ class GlassWindow(QWidget):
             grad.setColorAt(1.0, QColor("#eef1fa"))
             pp.fillRect(QRectF(0, 0, w, h), grad)
 
-        # 白色蒙版 —— 玻璃感主体
-        pp.fillRect(QRectF(0, 0, w, h), BG_TINT)
+        # 白色蒙版 —— 玻璃感主体，也是「背景有多花」的总闸
+        pp.fillRect(QRectF(0, 0, w, h), QColor(246, 249, 255, self.glass["tint"]))
 
         # 两团柔光：用预渲染的小贴图放大贴（大尺寸径向渐变会拖垮软件光栅化）
-        for fx, fy, fr, col in ((0.20, 0.12, 0.42, (150, 190, 255, 92)),
-                                (0.86, 0.80, 0.45, (200, 175, 255, 84))):
+        gk = self.glass["glow"]
+        for fx, fy, fr, col in ((0.20, 0.12, 0.42, (150, 190, 255, int(92 * gk))),
+                                (0.86, 0.80, 0.45, (200, 175, 255, int(84 * gk)))):
             r = max(40, int(w * fr))
             blob = glow_pixmap(col)
             pp.drawPixmap(QRectF(int(w * fx) - r, int(h * fy) - r, r * 2, r * 2),
@@ -712,6 +752,21 @@ class GlassWindow(QWidget):
         self.lbl_status.setObjectName("muted")
         row.addWidget(self.lbl_status)
         row.addStretch(1)
+
+        lb = QLabel("玻璃浓度")
+        lb.setObjectName("muted")
+        row.addWidget(lb)
+        self.cb_glass = QComboBox()
+        self.cb_glass.addItems(list(GLASS_LEVELS.keys()))
+        self.cb_glass.setCurrentText(self.glass_name)
+        self.cb_glass.setFixedWidth(88)
+        self.cb_glass.setToolTip(
+            "桌面壁纸花、看久了累眼时，选「沉稳」或「实底」：\n"
+            "背景会被压得更淡、模糊更强，卡片也更实。")
+        self.cb_glass.currentTextChanged.connect(self.on_glass_change)
+        row.addWidget(self.cb_glass)
+        row.addSpacing(12)
+
         credit = QLabel(CREDIT)
         credit.setObjectName("muted")
         credit.setStyleSheet("color:#9aa1ab;")
@@ -719,6 +774,23 @@ class GlassWindow(QWidget):
         grip = QSizeGrip(self)
         row.addWidget(grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         return row
+
+    def on_glass_change(self, name):
+        """切换玻璃浓度：换样式表 + 按新模糊半径重抓桌面 + 重建整窗缓存。
+
+        三件事必须一起做，缺一个就会出现「卡片实了但背景还是花的」这类半吊子状态。
+        """
+        if name not in GLASS_LEVELS:
+            return
+        self.glass_name = name
+        self.glass = GLASS_LEVELS[name]
+        self.cfg["glassLevel"] = name
+        save_config(self.cfg)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_qss(name))
+        self.grab_backdrop()
+        self.set_status("玻璃浓度已切换为：%s（已记住，下次启动沿用）" % name)
 
     def _wire_timers(self):
         self.timer_refresh = QTimer(self)
@@ -1159,7 +1231,8 @@ class GlassWindow(QWidget):
 def run_gui(repo=None):
     """供入口调用；异常会写 error.log 并弹窗"""
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setStyleSheet(QSS)
+    _cfg = load_config()
+    app.setStyleSheet(build_qss(_cfg.get("glassLevel") or DEFAULT_GLASS))
     icon_path = os.path.join(RES, "app.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))

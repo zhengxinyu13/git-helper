@@ -64,8 +64,8 @@ GREEN = "#15803d"
 ORANGE = "#b45309"
 RED = "#b91c1c"
 
-SHADOW_MARGIN = 14       # 窗口四周留给阴影的空白
-CORNER = 18              # 窗口圆角
+SHADOW_MARGIN = 20       # 窗口四周留给阴影的空白（阴影要够宽才「浮」得起来）
+CORNER = 22              # 窗口圆角
 BAR_H = 52               # 自绘标题栏高度
 
 _QSS_TEMPLATE = """
@@ -330,6 +330,19 @@ class GlassWindow(QWidget):
         pp = QPainter(pm)
         pp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        # 圆角裁剪：必须在画内容「之前」用 setClipPath 定好裁剪区。
+        #
+        # 坑（PyQt6 6.11 实测）：不要用 DestinationIn 合成模式去裁 ——
+        # `setCompositionMode(DestinationIn) + fillPath(圆角矩形)` 在 QPixmap 上
+        # 完全不生效（换成 ARGB32 格式、换成 QBrush 结果一样），四角会残留
+        # 「模糊桌面 + 白蒙版」，在深色壁纸上表现为窗口圆角外侧一块白透的小三角。
+        # setClipPath 在**离屏 pixmap** 上是好的；会卡死的是顶层半透明窗口的
+        # QPainter（见上方函数注释），两者别混。
+        if radius > 0:
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(0, 0, w, h), float(radius), float(radius))
+            pp.setClipPath(clip)
+
         # 底：模糊桌面，没有就用渐变
         if not self.backdrop.isNull():
             pp.drawPixmap(QRectF(0, 0, w, h), self.backdrop,
@@ -352,12 +365,6 @@ class GlassWindow(QWidget):
             pp.drawPixmap(QRectF(int(w * fx) - r, int(h * fy) - r, r * 2, r * 2),
                           blob, QRectF(blob.rect()))
 
-        # 圆角遮罩：DestinationIn 只保留圆角内，边缘带抗锯齿
-        if radius > 0:
-            mask = QPainterPath()
-            mask.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
-            pp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-            pp.fillPath(mask, QColor(0, 0, 0, 255))
         pp.end()
         return pm
 
@@ -378,22 +385,32 @@ class GlassWindow(QWidget):
 
         # 1) 外阴影（QRect.adjusted 只接受 int，传 float 会抛 TypeError
         #    并让整个进程直接退出 —— 这个坑踩过一次）
+        #    分 8 层由外向内叠加：越靠外越淡。原先只有 4 层、扩散不到 11px，
+        #    在浅色/花哨壁纸上几乎看不见，窗口边界糊在背景里，看起来就像
+        #    「直角矩形 + 角上一条圆弧」。加宽后圆角轮廓才浮得出来。
         if not self._maximized:
-            for i in range(4, 0, -1):
-                pad = int(i * 2.6)
+            for i in range(8, 0, -1):
+                pad = int(i * 2.2)
                 sp = QPainterPath()
-                sp.addRoundedRect(QRectF(inner.adjusted(-pad, -pad + 1, pad, pad)),
+                sp.addRoundedRect(QRectF(inner.adjusted(-pad, -pad + 2, pad, pad)),
                                   float(radius + pad), float(radius + pad))
-                p.fillPath(sp, QColor(20, 26, 40, 8 + i * 3))
+                p.fillPath(sp, QColor(17, 23, 38, 3 + i * 2))
 
         # 2) 玻璃底
         glass = self.render_glass(inner.width(), inner.height(), radius)
         p.drawPixmap(inner.topLeft(), glass)
 
-        # 3) 高光边框
+        # 3) 边缘两道：外侧淡灰 + 内侧白色高光。
+        #    只留一道白高光时，玻璃边缘在浅色壁纸上完全看不出，圆角就"消失"了。
+        outer = QPainterPath()
+        outer.addRoundedRect(QRectF(inner.adjusted(-1, -1, 1, 1)),
+                             float(radius + 1), float(radius + 1))
+        p.setPen(QPen(QColor(118, 130, 156, 95), 1))
+        p.drawPath(outer)
+
         path = QPainterPath()
         path.addRoundedRect(QRectF(inner), radius, radius)
-        p.setPen(QPen(QColor(255, 255, 255, 190), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 240), 1))
         p.drawPath(path)
         p.end()
 

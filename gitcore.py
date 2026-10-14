@@ -12,6 +12,7 @@ Git 提交助手 —— 核心逻辑层（纯标准库，无任何 GUI 依赖）
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import traceback
@@ -29,6 +30,30 @@ def _app_dir():
 def _res_dir():
     base = getattr(sys, "_MEIPASS", None)
     return base or os.path.dirname(os.path.abspath(__file__))
+
+
+def _user_dir():
+    """个人配置目录：%APPDATA%\\Git 提交助手（仅打包后的 exe 用）。
+
+    为什么不放程序目录：程序目录会被安装/卸载/覆盖安装反复改写，
+    配置放那儿迟早被带走（用户反馈过：升级后最近仓库记录和定时设置全没了）。
+    挪到用户目录后，升级、覆盖安装、卸载都不会碰它 —— 重装回来设置还在。
+
+    源码模式返回 None（继续用源码目录，保持「拎着文件夹就能跑」的便携性）。
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    try:
+        d = os.path.join(base, "Git 提交助手")
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".writetest")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("1")
+        os.remove(probe)
+        return d
+    except Exception:
+        return None          # 用户目录不可写就回退到程序目录，别因此崩掉
 
 
 def _is_self_dir(d):
@@ -62,12 +87,35 @@ def _guess_default_repo():
     return HERE
 
 
-HERE = _app_dir()          # 可写：config.json / error.log 放这
+HERE = _app_dir()          # 可写：程序所在目录
 RES = _res_dir()           # 只读资源：app.ico
+USER_DIR = _user_dir()     # 个人配置目录（打包后为 %APPDATA%，源码模式为 None）
 DEFAULT_REPO = _guess_default_repo()
-CONFIG_PATH = os.path.join(HERE, "config.json")
-ERROR_LOG = os.path.join(HERE, "error.log")
+# 配置与日志一律落在用户目录（拿不到就退回程序目录）
+_CONFIG_HOME = USER_DIR or HERE
+CONFIG_PATH = os.path.join(_CONFIG_HOME, "config.json")
+ERROR_LOG = os.path.join(_CONFIG_HOME, "error.log")
 CREDIT = "This software was written by Grayson Zheng."
+
+
+def _migrate_legacy_config():
+    """把旧版留在程序目录里的 config.json 搬到用户目录（只搬一次）。
+
+    老版本（<=1.0.3）把配置写在 exe 旁边。升级到新版后如果不管，
+    用户会发现"最近仓库记录没了"，所以启动时静默搬一次。
+    """
+    if not USER_DIR:
+        return
+    legacy = os.path.join(HERE, "config.json")
+    if not os.path.isfile(legacy) or os.path.isfile(CONFIG_PATH):
+        return
+    try:
+        shutil.copy2(legacy, CONFIG_PATH)
+    except Exception:
+        pass
+
+
+_migrate_legacy_config()
 
 DEFAULT_CONFIG = {
     "autoEnabled": True,
@@ -116,6 +164,7 @@ def load_config():
 
 def save_config(cfg):
     try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:

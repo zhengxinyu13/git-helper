@@ -7,13 +7,15 @@
 ;       脚本会在安装完成后检测，没装就弹提示（不阻断安装）。
 
 #define MyAppName "Git 提交助手"
-#define MyAppVersion "1.0.3"
+#define MyAppVersion "1.0.4"
 #define MyAppPublisher "Grayson Zheng"
 #define MyAppExeName "Git提交助手.exe"
 #define MyCliExeName "GitHelper-CLI.exe"
+; AppId 必须永远不变：升级时靠它认出旧版本，改了就会装成第二份
+#define MyAppId "{967E7D85-8020-42D6-8F0B-866FA354AB62}"
 
 [Setup]
-AppId={{967E7D85-8020-42D6-8F0B-866FA354AB62}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -117,10 +119,64 @@ Filename: "{app}\{#MyAppExeName}"; Description: "安装完成后立即启动 Git
     Flags: nowait postinstall skipifsilent unchecked
 
 [UninstallDelete]
+; 只清理旧版本（<=1.0.3）遗留在程序目录里的运行时文件。
+; 1.0.4 起用户配置改存 %APPDATA%\Git 提交助手\，卸载不会带走。
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\error.log"
 
 [Code]
+var
+  OldVersion: string;
+
+function InstalledVersion(): string;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKEY_CURRENT_USER,
+       'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1',
+       'DisplayVersion', Result) then
+    Result := '';
+end;
+
+procedure InitializeWizard();
+var
+  i: Integer;
+begin
+  OldVersion := InstalledVersion();
+  if OldVersion = '' then
+    exit;                       // 全新安装，文案用默认
+
+  { 就地升级：只替换程序文件，不卸载、不动快捷方式、不动用户配置 }
+  WizardForm.Caption := '升级 - {#MyAppName}';
+  WizardForm.WelcomeLabel1.Caption := '欢迎使用 {#MyAppName} 升级向导';
+  WizardForm.WelcomeLabel2.Caption :=
+    '这台电脑上已经装有 {#MyAppName} ' + OldVersion + '，即将升级到 {#MyAppVersion}。' + #13#10 + #13#10 +
+    '升级只替换程序文件：你的最近仓库记录、自动提交设置、玻璃浓度都会保留，' + #13#10 +
+    '桌面和开始菜单的快捷方式也不会被删除或移动。';
+  WizardForm.ReadyLabel1.Caption :=
+    '安装程序已准备好，即将把 {#MyAppName} 升级到 {#MyAppVersion}。';
+  WizardForm.FinishedHeadingLabel.Caption := '{#MyAppName} 升级完成';
+  WizardForm.FinishedLabelNoIcons.Caption :=
+    '已升级到 {#MyAppVersion}。你的个人设置和快捷方式都原样保留。';
+  WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabelNoIcons.Caption;
+
+  { 桌面快捷方式已经存在就把这个任务勾上：
+    一是位置不会动（不会删掉重建），二是新的卸载记录里能记上它 }
+  for i := 0 to WizardForm.TasksList.Items.Count - 1 do
+  begin
+    if Pos('桌面', WizardForm.TasksList.ItemCaption[i]) > 0 then
+    begin
+      if FileExists(ExpandConstant('{autodesktop}\{#MyAppName}.lnk')) then
+        WizardForm.TasksList.Checked[i] := True;
+    end;
+  end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpReady) and (OldVersion <> '') then
+    WizardForm.NextButton.Caption := '升级(&U)';
+end;
+
 function GitInstalled(): Boolean;
 var
   s: string;
@@ -170,13 +226,24 @@ var
 begin
   if CurUninstallStep <> usPostUninstall then
     exit;
-  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath) then
-    exit;
-  AppPath := ExpandConstant('{app}');
-  PosApp := Pos(';' + Uppercase(AppPath), Uppercase(NewPath));
-  if PosApp > 0 then
+
+  { 把安装时追加进 PATH 的那一段摘掉 }
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath) then
   begin
-    Delete(NewPath, PosApp, Length(AppPath) + 1);
-    RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
+    AppPath := ExpandConstant('{app}');
+    PosApp := Pos(';' + Uppercase(AppPath), Uppercase(NewPath));
+    if PosApp > 0 then
+    begin
+      Delete(NewPath, PosApp, Length(AppPath) + 1);
+      RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
+    end;
   end;
+
+  { 卸载删的是程序，不是个人数据 —— 明确告诉用户设置还在哪 }
+  if not UninstallSilent then
+    MsgBox('{#MyAppName} 已卸载。' + #13#10 + #13#10 +
+           '你的个人设置（最近仓库、自动提交、玻璃浓度）保存在：' + #13#10 +
+           '    ' + ExpandConstant('{userappdata}') + '\{#MyAppName}\config.json' + #13#10 + #13#10 +
+           '以后再装回来会自动沿用，不用重新配置。',
+           mbInformation, MB_OK);
 end;

@@ -28,9 +28,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      create_branch, delete_branch, discard_all, do_commit,
                      get_branches, get_diff, get_log, get_status, git,
-                     init_repo, is_cloud_dir, is_repo, load_config, log_exception,
-                     merge_branch, abort_merge, remember_repo, reset_to,
-                     restore_file, revert_commit, save_config, switch_branch)
+                     ensure_gitignore, init_repo, is_cloud_dir, is_repo,
+                     load_config, log_exception, merge_branch, abort_merge,
+                     remember_repo, reset_to, restore_file, revert_commit,
+                     save_config, switch_branch)
 
 # ---------------------------------------------------------------- 配色
 CARD_BORDER = "rgba(255, 255, 255, 0.85)"
@@ -903,6 +904,12 @@ class GlassWindow(QWidget):
         b = QPushButton("初始化此目录并首次提交")
         b.clicked.connect(self.init_current)
         row.addWidget(b)
+
+        b = QPushButton("忽略规则")
+        b.setToolTip("在仓库里生成 / 补齐 .gitignore：\n"
+                     "Office 锁文件（~$*）、临时文件、云盘冲突副本等默认不入库。")
+        b.clicked.connect(self.do_gitignore)
+        row.addWidget(b)
         self.update_recent()
         return row
 
@@ -1214,6 +1221,26 @@ class GlassWindow(QWidget):
         self.set_status(msg)
         self.refresh()
         self._warn_cloud()
+
+    def do_gitignore(self):
+        """生成 / 补齐默认忽略规则。"""
+        path = os.path.normpath(self.ed_repo.text().strip().strip('"'))
+        if not path or not os.path.isdir(path):
+            Msg.information(self, "提示", "先填写或浏览一个仓库目录。")
+            return
+        try:
+            n = ensure_gitignore(path)
+        except Exception as e:
+            Msg.critical(self, "写入失败", str(e))
+            return
+        if is_repo(path):
+            self.refresh()
+        Msg.information(
+            self, "完成",
+            ("已在 %s 写入 %d 条默认忽略规则：\n"
+             "Office 锁文件、临时文件、云盘冲突副本等不再入库。" % (path, n))
+            if n else "忽略规则已齐全，无需改动。")
+        self.set_status("忽略规则：新增 %d 条" % n if n else "忽略规则已齐全")
 
     def _mark_cloud(self):
         """仓库在云盘同步目录里时，标题栏挂一个提示标签。"""

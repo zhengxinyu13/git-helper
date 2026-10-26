@@ -9,6 +9,7 @@ Git 提交助手 —— 核心逻辑层（纯标准库，无任何 GUI 依赖）
 
 改这里等于同时改两边，不要把 git 逻辑复制到 GUI 里。
 """
+import fnmatch
 import json
 import os
 import platform
@@ -170,6 +171,76 @@ def is_cloud_dir(path):
             return label
     return None
 
+
+# ---------------------------------------------------------------- 忽略规则
+# 自动提交最大的隐患是「垃圾文件也被交进去」：Office 打开文档时生成的 ~$ 锁文件、
+# 各种临时文件、云盘冲突副本。这些文件本来就不该进版本库，所以这里备一份默认清单，
+# 建库时写进 .gitignore，并且提交时再拦一道（已有仓库没写 .gitignore 也照样生效）。
+#
+# 注意：.gitignore 不支持行内 # 注释，「~$*  # 锁文件」这种写法会让整行失效。
+DEFAULT_IGNORES = [
+    "~$*",
+    "*.tmp",
+    "*.temp",
+    "*.bak",
+    "*.swp",
+    "*.crdownload",
+    "*.part",
+    "*.~lock",
+    "__pycache__/",
+    "*.py[cod]",
+    ".DS_Store",
+    "Thumbs.db",
+    "*的冲突副本*",
+    "*conflicted copy*",
+]
+
+IGNORE_BEGIN = "# >>> Git 提交助手：以下由程序维护，可自行增删 >>>"
+IGNORE_END = "# <<< Git 提交助手：以上由程序维护，下面写你自己的规则 <<<"
+
+
+def ensure_gitignore(repo):
+    """保证仓库有一份带默认规则的 .gitignore。返回新增了几条规则。
+
+    - 没有 .gitignore → 整份新建；
+    - 已有但没有助手段落 → 在文件末尾追加一段；
+    - 已有助手段落 → 只补齐缺的规则，不动用户自己写的部分。
+    """
+    path = os.path.join(repo, ".gitignore")
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+
+    try:
+        b, e = lines.index(IGNORE_BEGIN), lines.index(IGNORE_END)
+        block, head, tail = lines[b + 1:e], lines[:b], lines[e + 1:]
+    except ValueError:
+        block, head, tail = [], lines, []
+
+    added = [r for r in DEFAULT_IGNORES if r not in block]
+    block = block + added
+
+    if not head and not tail and not added and block == DEFAULT_IGNORES:
+        return 0                                   # 已是标准状态，不用重写
+
+    out = head + [IGNORE_BEGIN] + block + [IGNORE_END] + tail
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+    return len(added)
+
+
+def is_ignored(rel):
+    """文件名是否命中默认忽略清单（不依赖 .gitignore 是否写全，双保险）。"""
+    base = os.path.basename(rel)
+    for pat in DEFAULT_IGNORES:
+        if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(rel, pat):
+            return True
+    return False
+
 STATUS_LABEL = {
     "??": "新增", "A ": "新增", "AM": "新增",
     "M ": "修改", " M": "修改", "MM": "修改",
@@ -260,6 +331,7 @@ def init_repo(path):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
     git(path, "init", "-b", "main")
+    ensure_gitignore(path)          # 先立规矩，再 add，垃圾文件才不会进首次提交
     git(path, "add", "-A")
     if has_staged(path):
         git(path, "commit", "-m", "chore: 初始化仓库，纳入现有文件")
@@ -373,6 +445,8 @@ def unstable_reason(repo, rel, stable_seconds=None):
     base = os.path.basename(rel)
     if base.startswith("~$"):
         return "Office 临时锁文件"
+    if base == ".gitignore":
+        return None          # 程序自己刚写好的规则文件，写完即稳定，不用等
     secs = DEFAULT_CONFIG["stableSeconds"] if stable_seconds is None else stable_seconds
     full = os.path.join(repo, rel)
     # 已删除的文件不在磁盘上，删掉是明确动作，不该被"稳定性"拦住
@@ -424,8 +498,17 @@ def do_commit(repo, message=None, paths=None, skip_unstable=True):
         files = [f for f in files if f["path"] in wanted]
 
     kept, skipped = files, []
+    # 1) 忽略规则优先：不管 .gitignore 有没有写全，这类文件一律不进版本库
+    blocked = [f for f in kept if is_ignored(f["path"])]
+    if blocked:
+        bp = {f["path"] for f in blocked}
+        kept = [f for f in kept if f["path"] not in bp]
+        skipped += [{"status": f["status"], "path": f["path"],
+                     "reason": "默认忽略规则"} for f in blocked]
+    # 2) 再看文件是不是还在写入中
     if skip_unstable:
-        kept, skipped = filter_stable(repo, files)
+        kept, s2 = filter_stable(repo, kept)
+        skipped += s2
 
     if not kept:
         if skipped:

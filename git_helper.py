@@ -18,10 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 
 from gitcore import (DEFAULT_REPO, create_backup, create_branch, delete_branch,
-                     discard_all, do_commit, get_branches, get_diff, get_log,
-                     get_status, git, init_repo, is_repo, load_config,
-                     abort_merge, merge_branch, remember_repo, reset_to,
-                     restore_file, revert_commit, save_config, switch_branch)
+                     discard_all, do_commit, ensure_gitignore, get_branches,
+                     get_diff, get_log, get_status, git, init_repo, is_repo,
+                     load_config, abort_merge, merge_branch, remember_repo,
+                     reset_to, restore_file, revert_commit, save_config,
+                     switch_branch)
 
 CLI_HELP = """Git 提交助手（命令行）
 
@@ -86,6 +87,7 @@ def build_parser():
     sp = sub.add_parser("merge", help="合并分支")
     sp.add_argument("name", nargs="?", default=None, help="要合并进来的分支；--abort 时可省略")
     sp.add_argument("--abort", action="store_true", help="中止进行中的合并")
+    sub.add_parser("ignore", help="生成/补齐 .gitignore 默认忽略规则")
     sp = sub.add_parser("use", help="设定默认仓库，之后所有命令都针对它")
     sp.add_argument("path")
     sub.add_parser("repos", help="列出最近打开过的仓库")
@@ -116,6 +118,11 @@ def cli_main(argv=None):
             ok, msg = init_repo(os.path.normpath(args.path))
             remember_repo(cfg, os.path.normpath(args.path))
             out = {"ok": ok, "repo": cfg["lastRepo"], "message": msg}
+
+        elif args.cmd == "ignore":
+            n = ensure_gitignore(repo)
+            out = {"ok": True, "repo": repo, "added": n,
+                   "message": ("已写入 %d 条默认忽略规则" % n) if n else "规则已齐全"}
 
         elif args.cmd == "use":
             path = os.path.normpath(args.path)

@@ -13,7 +13,8 @@ Git 提交助手 —— PyQt6 图形界面（真玻璃拟态）
 import os
 import sys
 
-from PyQt6.QtCore import QDateTime, QPoint, QRect, QRectF, Qt, QTimer
+from PyQt6.QtCore import (QDateTime, QPoint, QRect, QRectF, QObject, QRunnable,
+                          Qt, QThreadPool, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient,
                          QIcon, QFontDatabase)
@@ -21,16 +22,19 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                              QComboBox, QDialog, QFileDialog, QFrame,
                              QGraphicsBlurEffect,
                              QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMessageBox, QPushButton, QSizeGrip,
-                             QSplitter, QTableWidget, QTableWidgetItem,
+                             QLineEdit, QMenu, QMessageBox, QPushButton,
+                             QSizeGrip, QSplitter, QSystemTrayIcon,
+                             QTableWidget, QTableWidgetItem,
                              QTextEdit, QVBoxLayout, QWidget)
 
 from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      create_branch, delete_branch, discard_all, do_commit,
                      get_branches, get_diff, get_log, get_status, git,
-                     init_repo, is_repo, load_config, log_exception, merge_branch,
-                     abort_merge, remember_repo, reset_to, restore_file,
-                     revert_commit, save_config, switch_branch)
+                     ensure_gitignore, get_launch_at_login, init_repo,
+                     is_cloud_dir, is_repo, load_config, log_exception,
+                     merge_branch, abort_merge, remember_repo, reset_to,
+                     restore_file, revert_commit, save_config,
+                     set_launch_at_login, switch_branch)
 
 # ---------------------------------------------------------------- 配色
 CARD_BORDER = "rgba(255, 255, 255, 0.85)"
@@ -55,6 +59,10 @@ GLASS_LEVELS = {
              "field": "0.97", "table": "0.90", "head": "0.86", "glow": 0.2},
 }
 # 默认取「沉稳」：复杂桌面下不刺眼，同时还能看出背景轮廓，玻璃感仍在。
+
+# 自动提交撞上「文件还在写入」时，隔多久补一次（毫秒）。
+# 太短会每分钟重试一次、状态栏一直跳；太长就失去「等它写完再交」的意义。
+RETRY_MS = 5 * 60 * 1000
 DEFAULT_GLASS = "沉稳"
 TEXT = "#1f2937"
 MUTED = "#7b8494"
@@ -91,6 +99,13 @@ QLabel#chip {{
 }}
 QLabel#muted {{
     color: {muted};
+    font-size: 8pt;
+}}
+QLabel#chipWarn {{
+    color: #8a5300;
+    background: rgba(250, 199, 117, 0.55);
+    border-radius: 8px;
+    padding: 2px 8px;
     font-size: 8pt;
 }}
 QLabel#groupTitle {{
@@ -524,6 +539,28 @@ class Msg:
         return "", False
 
 
+# ---------------------------------------------------------------- 后台执行
+# git 命令是子进程调用，在云盘目录里尤其慢（status 要扫一遍工作区）。
+# 直接放在主线程里跑，执行那几百毫秒到几秒里界面是完全卡住的：
+# 拖不动、按钮没反应。所以统一丢到后台线程，主线程只负责收结果刷界面。
+class _TaskSignals(QObject):
+    done = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+
+class _Task(QRunnable):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.signals = _TaskSignals()
+
+    def run(self):
+        try:
+            self.signals.done.emit(self.fn())
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
 class GlassWindow(QWidget):
     """无边框 + 半透明 + 自绘玻璃背景的主窗口。
 
@@ -556,6 +593,16 @@ class GlassWindow(QWidget):
 
         self._build_ui()
         self._wire_timers()
+        self._mark_cloud()
+
+        # 同一仓库上的 git 操作必须串行：两个 git 同时写 .git 会互相踩
+        # （典型后果是 index.lock 报错、提交丢一半）。所以池子里只留 1 条线程。
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self._tasks = []
+        self._pending = 0
+        self._real_close = False          # 托盘菜单「退出」时置 True，绕开缩托盘
+        self._init_tray()
 
         # 关键：在窗口 show 之前抓桌面，抓到的才是纯桌面背景（不含自己）
         self.grab_backdrop()
@@ -563,6 +610,103 @@ class GlassWindow(QWidget):
         # 启动后立刻读一次仓库，不用干等第一个 20 秒轮询
         QTimer.singleShot(200, self.refresh)
         QTimer.singleShot(1500, self.auto_tick)
+        QTimer.singleShot(2000, self._warn_cloud)
+
+    # ------------------------------------------------------------ 系统托盘
+    def _init_tray(self):
+        """托盘常驻：关掉窗口只是藏起来，定时自动提交继续在后台跑。
+
+        这是「自动提交」能真正自动的前提 —— 否则窗口一关，定时器就没了。
+        """
+        self.tray = None
+        # 开机自启以注册表为准（配置可能和真实状态不同步），托盘可用与否都要同步
+        if hasattr(self, "chk_boot"):
+            self.chk_boot.blockSignals(True)
+            self.chk_boot.setChecked(get_launch_at_login())
+            self.chk_boot.blockSignals(False)
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon_path = os.path.join(RES, "app.ico")
+        self.tray = QSystemTrayIcon(QIcon(icon_path) if os.path.exists(icon_path)
+                                    else QIcon(), self)
+        self.tray.setToolTip("Git 提交助手")
+
+        menu = QMenu()
+        menu.setStyleSheet(
+            "QMenu { background: #fbfcfe; border: 1px solid rgba(120,132,156,0.35);"
+            " border-radius: 10px; padding: 6px; }"
+            "QMenu::item { padding: 6px 22px; border-radius: 6px; color: #2f3742; }"
+            "QMenu::item:selected { background: #e7efff; }")
+
+        act_show = menu.addAction("打开主界面")
+        act_show.triggered.connect(self._tray_show)
+        act_now = menu.addAction("立即提交")
+        act_now.triggered.connect(self.run_now)
+        menu.addSeparator()
+        self.act_boot = menu.addAction("开机自启")
+        self.act_boot.setCheckable(True)
+        self.act_boot.setChecked(get_launch_at_login())
+        self.act_boot.triggered.connect(self._toggle_boot)
+        menu.addSeparator()
+        act_quit = menu.addAction("退出")
+        act_quit.triggered.connect(self._tray_quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+        # 窗口藏起来时不能让 Qt 认为「最后一个窗口关了」而直接退出程序
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+
+    def _tray_show(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.grab_backdrop()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
+                      QSystemTrayIcon.ActivationReason.Trigger):
+            self._tray_show()
+
+    def _apply_boot(self, checked):
+        """开机自启总入口：写 HKCU 的 Run 项，并把状态栏和托盘菜单两处开关同步。
+
+        开机自启只对打包后的 exe 生效 —— 源码模式没有可登记的程序路径。
+        """
+        widgets = [getattr(self, "act_boot", None), getattr(self, "chk_boot", None)]
+        if not set_launch_at_login(checked):
+            for wgt in widgets:
+                if wgt is None:
+                    continue
+                wgt.blockSignals(True)
+                wgt.setChecked(False)
+                wgt.blockSignals(False)
+            Msg.information(
+                self, "未能设置",
+                "开机自启只对打包后的程序生效（源码模式没有可登记的程序路径）。")
+            return
+        self.cfg["launchAtLogin"] = checked
+        save_config(self.cfg)
+        for wgt in widgets:
+            if wgt is None:
+                continue
+            wgt.blockSignals(True)
+            wgt.setChecked(checked)
+            wgt.blockSignals(False)
+        self.set_status("开机自启已%s" % ("开启" if checked else "关闭"))
+
+    def _toggle_boot(self, checked):
+        self._apply_boot(checked)
+
+    def on_boot_change(self, *_a):
+        self._apply_boot(self.chk_boot.isChecked())
+
+    def _tray_quit(self):
+        self._real_close = True
+        self.close()
 
     def _center_on_screen(self):
         try:
@@ -836,9 +980,23 @@ class GlassWindow(QWidget):
         self.btn_runnow.clicked.connect(self.run_now)
         bar.addWidget(self.btn_runnow)
 
+        self.chk_safe = QCheckBox("跳过写入中")
+        self.chk_safe.setChecked(bool(self.cfg.get("skipUnstable", True)))
+        self.chk_safe.setToolTip(
+            "提交时跳过三类文件：Office/WPS 的 ~$ 锁文件、正被 Office 打开的文档、"
+            "以及 2 分钟内刚改过的文件（云盘可能还没同步完）。\n"
+            "取消勾选 = 回到原来的「全部 add 进去」。")
+        self.chk_safe.stateChanged.connect(self.on_safe_change)
+        bar.addWidget(self.chk_safe)
+
         self.lbl_last = QLabel("")
         self.lbl_last.setObjectName("muted")
         bar.addWidget(self.lbl_last)
+
+        self.lbl_cloud = QLabel("")
+        self.lbl_cloud.setObjectName("chipWarn")
+        self.lbl_cloud.setVisible(False)
+        bar.addWidget(self.lbl_cloud)
 
         bar.addStretch(1)
 
@@ -875,6 +1033,12 @@ class GlassWindow(QWidget):
 
         b = QPushButton("初始化此目录并首次提交")
         b.clicked.connect(self.init_current)
+        row.addWidget(b)
+
+        b = QPushButton("忽略规则")
+        b.setToolTip("在仓库里生成 / 补齐 .gitignore：\n"
+                     "Office 锁文件（~$*）、临时文件、云盘冲突副本等默认不入库。")
+        b.clicked.connect(self.do_gitignore)
         row.addWidget(b)
         self.update_recent()
         return row
@@ -1059,6 +1223,21 @@ class GlassWindow(QWidget):
         row.addWidget(self.lbl_status)
         row.addStretch(1)
 
+        self.chk_tray = QCheckBox("缩到托盘")
+        self.chk_tray.setChecked(bool(self.cfg.get("minimizeToTray", True)))
+        self.chk_tray.setToolTip(
+            "关闭窗口时只藏到系统托盘，定时自动提交继续在后台跑。\n"
+            "取消勾选后，关窗口就是真正退出（自动提交随之停止）。")
+        self.chk_tray.stateChanged.connect(self.on_tray_change)
+        row.addWidget(self.chk_tray)
+        row.addSpacing(10)
+
+        self.chk_boot = QCheckBox("开机自启")
+        self.chk_boot.setToolTip("登录 Windows 后自动启动（登记在「当前用户」的启动项里）。")
+        self.chk_boot.stateChanged.connect(self.on_boot_change)
+        row.addWidget(self.chk_boot)
+        row.addSpacing(12)
+
         lb = QLabel("玻璃浓度")
         lb.setObjectName("muted")
         row.addWidget(lb)
@@ -1097,6 +1276,19 @@ class GlassWindow(QWidget):
             app.setStyleSheet(build_qss(name))
         self.grab_backdrop()
         self.set_status("玻璃浓度已切换为：%s（已记住，下次启动沿用）" % name)
+
+    def on_tray_change(self, *_a):
+        on = self.chk_tray.isChecked()
+        self.cfg["minimizeToTray"] = on
+        save_config(self.cfg)
+        self.set_status("关闭窗口时：%s"
+                        % ("缩到托盘，后台继续自动提交" if on else "直接退出程序"))
+
+    def on_safe_change(self, *_a):
+        self.cfg["skipUnstable"] = self.chk_safe.isChecked()
+        save_config(self.cfg)
+        self.set_status("跳过写入中的文件：%s"
+                        % ("开启" if self.cfg["skipUnstable"] else "关闭（全部提交）"))
 
     def _wire_timers(self):
         self.timer_refresh = QTimer(self)
@@ -1137,11 +1329,13 @@ class GlassWindow(QWidget):
                                 "目录不存在：\n%s\n\n点「初始化此目录并首次提交」可以创建它。" % path)
             return
         self.repo = path
+        self._mark_cloud()
         if is_repo(path):
             remember_repo(self.cfg, path)
             self.update_recent()
             self.set_status("已打开仓库：%s" % path)
             self.refresh()
+            self._warn_cloud()
         else:
             self.set_status("该目录不是 Git 仓库，点「初始化此目录并首次提交」即可。")
             self.clear_views()
@@ -1165,24 +1359,124 @@ class GlassWindow(QWidget):
                 "将在下面这个目录执行 git init，并把现有文件全部纳入首次提交：\n\n%s" % path) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            ok, msg = init_repo(path)
-        except Exception as e:
-            Msg.critical(self, "初始化失败", str(e))
+        self._run(lambda: init_repo(path),
+                  lambda res: self._after_init(path, res), "初始化仓库…")
+
+    def _after_init(self, path, res):
+        ok, msg = res
+        if not ok:
+            Msg.critical(self, "初始化失败", msg)
             return
         self.repo = path
         self.ed_repo.setText(path)
+        self._mark_cloud()
         remember_repo(self.cfg, path)
         self.update_recent()
         Msg.information(self, "完成", msg)
         self.set_status(msg)
         self.refresh()
+        self._warn_cloud()
+
+    def do_gitignore(self):
+        """生成 / 补齐默认忽略规则。"""
+        path = os.path.normpath(self.ed_repo.text().strip().strip('"'))
+        if not path or not os.path.isdir(path):
+            Msg.information(self, "提示", "先填写或浏览一个仓库目录。")
+            return
+        try:
+            n = ensure_gitignore(path)
+        except Exception as e:
+            Msg.critical(self, "写入失败", str(e))
+            return
+        if is_repo(path):
+            self.refresh()
+        Msg.information(
+            self, "完成",
+            ("已在 %s 写入 %d 条默认忽略规则：\n"
+             "Office 锁文件、临时文件、云盘冲突副本等不再入库。" % (path, n))
+            if n else "忽略规则已齐全，无需改动。")
+        self.set_status("忽略规则：新增 %d 条" % n if n else "忽略规则已齐全")
+
+    def _mark_cloud(self):
+        """仓库在云盘同步目录里时，标题栏挂一个提示标签。"""
+        cloud = is_cloud_dir(self.repo)
+        if not cloud:
+            self.lbl_cloud.setVisible(False)
+            return
+        self.lbl_cloud.setText("云盘目录 · %s" % cloud)
+        self.lbl_cloud.setToolTip(
+            "这个仓库在 %s 的同步目录里：\n"
+            "git 每次写入都会让云盘同步一批 .git 小文件，两边同时改同一文件时\n"
+            "还可能交到没同步完的半成品。已默认开启「跳过写入中」来规避。" % cloud)
+        self.lbl_cloud.setVisible(True)
+
+    def _warn_cloud(self):
+        """云盘目录里的仓库，每个路径只提示一次，避免每次启动都弹窗。"""
+        cloud = is_cloud_dir(self.repo)
+        if not cloud or self.cfg.get("cloudWarnedFor") == self.repo:
+            return
+        self.cfg["cloudWarnedFor"] = self.repo
+        save_config(self.cfg)
+        Msg.information(
+            self, "仓库位于云同步目录",
+            "当前仓库在 %s 的同步目录里：\n\n%s\n\n"
+            "git 每次写入都会触发云盘同步一批 .git 小文件；两边同时改同一个文件时，"
+            "还可能把没同步完的半成品交进去。\n\n"
+            "程序这边已经做了两件事：\n"
+            "1. 默认开启「跳过写入中」：刚改过 2 分钟内的、正被 Office 打开的文档，"
+            "不进本次提交；\n"
+            "2. 5 分钟后自动补交，不用你手动管。\n\n"
+            "建议你再做一步：在云盘客户端里把这个仓库的 .git 目录排除同步"
+            "（如果客户端有过滤规则的话）。" % (cloud, self.repo))
 
     def clear_views(self):
         self.files, self.logs, self.branches = [], [], []
         self.tbl_files.setRowCount(0)
         self.tbl_log.setRowCount(0)
         self.cb_branch.clear()
+
+    # ------------------------------------------------------------ 后台执行
+    def _run(self, fn, on_done=None, busy="执行中…", on_error=None):
+        """把一次 git 操作丢到后台串行执行，结果回到主线程再刷界面。
+
+        注意闭包里只能捕获「已经取出来的值」，不要在子线程里读控件
+        （Qt 的控件只能在主线程碰，跨线程调用会随机崩）。
+        """
+        task = _Task(fn)
+        task.setAutoDelete(False)
+        self._tasks.append(task)          # 持有引用，否则 Python 侧会被提前回收
+        self._pending += 1
+        self.set_status(busy)
+        task.signals.done.connect(lambda r, t=task: self._task_done(t, on_done, r))
+        task.signals.error.connect(lambda e, t=task: self._task_error(t, e, on_error))
+        self.pool.start(task)
+
+    def _task_done(self, task, on_done, result):
+        self._release(task)
+        try:
+            if on_done:
+                on_done(result)
+        except Exception:
+            log_exception(*sys.exc_info())
+            Msg.critical(self, "处理结果失败", "界面更新时出错，详情见 error.log")
+
+    def _task_error(self, task, msg, on_error):
+        self._release(task)
+        if on_error:
+            try:
+                on_error(msg)
+                return
+            except Exception:
+                log_exception(*sys.exc_info())
+        self.set_status("执行失败：" + msg)
+        Msg.critical(self, "执行失败", msg)
+
+    def _release(self, task):
+        self._pending = max(0, self._pending - 1)
+        try:
+            self._tasks.remove(task)
+        except ValueError:
+            pass
 
     # ------------------------------------------------------------ 分支
     def _need_repo(self):
@@ -1191,19 +1485,20 @@ class GlassWindow(QWidget):
             return False
         return True
 
+    def _after_simple(self, msg):
+        """分支新建/切换/删除这类「一句话结果」的通用收尾。"""
+        self.set_status(msg)
+        self.refresh()
+
     def do_create_branch(self):
         if not self._need_repo():
             return
         name, ok = Msg.getText(self, "新建分支", "分支名：")
         if not ok or not name.strip():
             return
-        try:
-            msg = create_branch(self.repo, name.strip(), switch=True)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo, nm = self.repo, name.strip()
+        self._run(lambda: create_branch(repo, nm, switch=True),
+                  self._after_simple, "新建分支…")
 
     def do_switch(self):
         if not self._need_repo():
@@ -1212,13 +1507,9 @@ class GlassWindow(QWidget):
         if not name:
             Msg.information(self, "提示", "先在下拉框里选一个分支。")
             return
-        try:
-            msg = switch_branch(self.repo, name)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: switch_branch(repo, name),
+                  self._after_simple, "切换分支…")
 
     def do_merge(self):
         if not self._need_repo():
@@ -1235,22 +1526,22 @@ class GlassWindow(QWidget):
                                 "把「%s」合并进当前分支「%s」？" % (src, cur)) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            r = merge_branch(self.repo, src)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        if r["merged"]:
-            Msg.information(self, "合并完成", r["message"])
-            self.set_status("已合并 %s → %s" % (src, cur))
-        else:
-            cf = r["conflicts"]
-            Msg.warning(
-                self, "合并有冲突",
-                "合并未完成，需要手动解决冲突：\n\n%s\n\n解决后提交，或点「中止合并」回到合并前。"
-                % ("\n".join(cf) if cf else r["message"]))
-            self.set_status("合并冲突：%d 个文件" % len(cf))
-        self.refresh()
+        repo = self.repo
+
+        def done(r):
+            if r["merged"]:
+                Msg.information(self, "合并完成", r["message"])
+                self.set_status("已合并 %s → %s" % (src, cur))
+            else:
+                cf = r["conflicts"]
+                Msg.warning(
+                    self, "合并有冲突",
+                    "合并未完成，需要手动解决冲突：\n\n%s\n\n解决后提交，或点「中止合并」回到合并前。"
+                    % ("\n".join(cf) if cf else r["message"]))
+                self.set_status("合并冲突：%d 个文件" % len(cf))
+            self.refresh()
+
+        self._run(lambda: merge_branch(repo, src), done, "合并中…")
 
     def do_delete_branch(self):
         if not self._need_repo():
@@ -1262,31 +1553,24 @@ class GlassWindow(QWidget):
                                 "删除分支「%s」？\n未合并的改动会丢失，建议先合并。" % name) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            msg = delete_branch(self.repo, name)
-        except Exception as e:
+        repo = self.repo
+
+        def on_error(e):
             if Msg.question(self, "删除失败",
                                     "%s\n\n有未合并的改动。要强制删除吗？" % e) \
                     != QMessageBox.StandardButton.Yes:
                 return
-            try:
-                msg = delete_branch(self.repo, name, force=True)
-            except Exception as e2:
-                Msg.critical(self, "失败", str(e2))
-                return
-        self.set_status(msg)
-        self.refresh()
+            self._run(lambda: delete_branch(repo, name, force=True),
+                      self._after_simple, "强制删除分支…")
+
+        self._run(lambda: delete_branch(repo, name), self._after_simple,
+                  "删除分支…", on_error=on_error)
 
     def do_abort_merge(self):
         if not self._need_repo():
             return
-        try:
-            msg = abort_merge(self.repo)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: abort_merge(repo), self._after_simple, "中止合并…")
 
     # ------------------------------------------------------------ 刷新
     def refresh(self):
@@ -1295,14 +1579,13 @@ class GlassWindow(QWidget):
             self.lbl_chip.setText("未初始化")
             self.lbl_count.setText("（不是 Git 仓库）")
             return
-        try:
-            branch, files = get_status(self.repo)
-            logs = get_log(self.repo, int(self.cfg.get("maxLog", 200)))
-            branches = get_branches(self.repo)
-        except Exception as e:
-            self.set_status("读取仓库失败：%s" % e)
-            return
+        repo, maxlog = self.repo, int(self.cfg.get("maxLog", 200))
+        self._run(lambda: (get_status(repo), get_log(repo, maxlog), get_branches(repo)),
+                  self._apply_refresh, "读取仓库…",
+                  on_error=lambda e: self.set_status("读取仓库失败：%s" % e))
 
+    def _apply_refresh(self, data):
+        (branch, files), logs, branches = data
         keep = set(self.selected_paths())
         self.files, self.logs, self.branches = files, logs, branches
         self.lbl_chip.setText("分支 " + branch)
@@ -1374,18 +1657,31 @@ class GlassWindow(QWidget):
         if not self._need_repo():
             return
         paths = self.selected_paths()
-        try:
-            h, msg = do_commit(self.repo, self.ed_msg.text(), paths or None)
-        except Exception as e:
-            Msg.critical(self, "提交失败", str(e))
-            return
+        text = self.ed_msg.text()          # 控件只能在主线程读，先把值取出来
+        repo = self.repo
+        skip = bool(self.cfg.get("skipUnstable", True))
+        self._run(lambda: do_commit(repo, text, paths or None, skip_unstable=skip),
+                  self._after_commit, "提交中…")
+
+    def _after_commit(self, res):
+        h, msg, skipped = res
         if h:
             self.ed_msg.clear()
-            self.set_status("已提交 %s：%s" % (h[:7], msg))
+            self._report_skipped(skipped, "已提交 %s：%s" % (h[:7], msg))
         else:
-            self.set_status(msg)
+            self._report_skipped(skipped, msg)
             Msg.information(self, "无需提交", msg)
         self.refresh()
+
+    def _report_skipped(self, skipped, base):
+        """把「本次跳过了哪些文件、为什么」接到状态栏文案后面。"""
+        if not skipped:
+            self.set_status(base)
+            return
+        head = skipped[0]
+        more = "等 %d 个文件" % len(skipped) if len(skipped) > 1 else ""
+        self.set_status("%s（跳过 %s：%s %s）"
+                        % (base, head["path"], head["reason"], more))
 
     def sel_all(self):
         self.tbl_files.selectAll()
@@ -1403,15 +1699,27 @@ class GlassWindow(QWidget):
                 "把选中的 %d 个文件还原到最近一次提交的状态？\n未保存的改动会丢失。\n\n%s"
                 % (len(paths), "\n".join(paths[:12]))) != QMessageBox.StandardButton.Yes:
             return
-        backup = create_backup(self.repo)
-        for p in paths:
-            try:
-                restore_file(self.repo, p)
-            except Exception as e:
-                Msg.critical(self, "还原失败", "%s\n%s" % (p, e))
-                break
-        self.set_status("已还原 %d 个文件（备份分支：%s）" % (len(paths), backup or "无"))
-        self.refresh()
+        repo = self.repo
+
+        def job():
+            backup = create_backup(repo)
+            errs = []
+            for p in paths:
+                try:
+                    restore_file(repo, p)
+                except Exception as e:
+                    errs.append("%s：%s" % (p, e))
+            return backup, errs
+
+        def done(res):
+            backup, errs = res
+            if errs:
+                Msg.critical(self, "还原失败", "\n".join(errs))
+            self.set_status("已还原 %d 个文件（备份分支：%s）"
+                            % (len(paths) - len(errs), backup or "无"))
+            self.refresh()
+
+        self._run(job, done, "还原文件…")
 
     def discard_all(self):
         if not self._need_repo():
@@ -1425,29 +1733,24 @@ class GlassWindow(QWidget):
         if Msg.question(self, "再次确认", "真的要丢弃全部未提交改动吗？") \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            backup = discard_all(self.repo)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status("已撤销全部未提交改动（备份分支：%s）" % (backup or "无"))
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: discard_all(repo),
+                  lambda backup: (
+                      self.set_status("已撤销全部未提交改动（备份分支：%s）" % (backup or "无")),
+                      self.refresh()),
+                  "撤销改动…")
 
     def show_commit_diff(self):
         h = self.sel_hash()
         if not h:
             Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
-        try:
-            self.set_diff(get_diff(self.repo, "commit", h))
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
+        repo = self.repo
+        self._run(lambda: get_diff(repo, "commit", h), self.set_diff, "读取差异…")
 
     def show_diff(self, kind):
-        try:
-            self.set_diff(get_diff(self.repo, kind))
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
+        repo = self.repo
+        self._run(lambda: get_diff(repo, kind), self.set_diff, "读取差异…")
 
     def revert_commit(self):
         h = self.sel_hash()
@@ -1459,13 +1762,8 @@ class GlassWindow(QWidget):
                 "生成一次「反向提交」来抵消 %s 的改动。\n历史记录完整保留，可再次撤销。\n\n继续？" % h[:7]) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            msg = revert_commit(self.repo, h)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: revert_commit(repo, h), self._after_simple, "反向撤销…")
 
     def reset_to_commit(self):
         h = self.sel_hash()
@@ -1487,13 +1785,13 @@ class GlassWindow(QWidget):
         if not ok:
             return
         mode = mode.split()[0]
-        try:
-            backup = reset_to(self.repo, h, mode)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status("已回退到 %s（%s，备份分支：%s）" % (h[:7], mode, backup or "无"))
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: reset_to(repo, h, mode),
+                  lambda backup: (
+                      self.set_status("已回退到 %s（%s，备份分支：%s）"
+                                      % (h[:7], mode, backup or "无")),
+                      self.refresh()),
+                  "回退中…")
 
     # ------------------------------------------------------------ 定时
     def on_schedule_change(self, *_a):
@@ -1513,25 +1811,53 @@ class GlassWindow(QWidget):
         self.auto_tick()
 
     def auto_tick(self):
-        try:
-            if self.cfg.get("autoEnabled") and is_repo(self.repo):
-                now_ms = QDateTime.currentMSecsSinceEpoch()
-                need = max(1, int(self.cfg.get("intervalHours", 1))) * 3600 * 1000
-                if now_ms - int(self.cfg.get("lastRunAt", 0)) >= need:
-                    self.cfg["lastRunAt"] = now_ms
-                    save_config(self.cfg)
-                    h, msg = do_commit(self.repo, None, None)
-                    if h:
-                        self.set_status("自动提交完成 %s：%s" % (h[:7], msg))
-                        self.refresh()
-                    else:
-                        self.set_status("自动提交检查：无变更，跳过")
-        except Exception as e:
-            self.set_status("自动提交失败：%s" % e)
+        if not (self.cfg.get("autoEnabled") and is_repo(self.repo)):
+            return
+        now_ms = QDateTime.currentMSecsSinceEpoch()
+        need = max(1, int(self.cfg.get("intervalHours", 1))) * 3600 * 1000
+        if now_ms - int(self.cfg.get("lastRunAt", 0)) < need:
+            return
+        repo = self.repo
+        skip = bool(self.cfg.get("skipUnstable", True))
+        self._run(lambda: do_commit(repo, None, None, skip_unstable=skip),
+                  lambda res: self._after_auto(res, now_ms, need), "自动提交…",
+                  on_error=lambda e: self.set_status("自动提交失败：" + e))
+
+    def _after_auto(self, res, now_ms, need):
+        h, msg, skipped = res
+        if h:
+            self.cfg["lastRunAt"] = now_ms
+            self._report_skipped(skipped,
+                                 "自动提交完成 %s：%s" % (h[:7], msg))
+            self.refresh()
+        else:
+            # 有文件还在写入 → 5 分钟后补交，别干等一整个周期；
+            # 单纯无变更 → 照常计时。
+            self.cfg["lastRunAt"] = (now_ms - need + RETRY_MS
+                                     if skipped else now_ms)
+            self._report_skipped(skipped,
+                                 "自动提交检查：" + (msg or "无变更"))
+        save_config(self.cfg)
 
     def closeEvent(self, event):
         save_config(self.cfg)
+        # 关窗口 = 缩到托盘（默认）。只有托盘真的在、且用户没点「退出」时才这么做，
+        # 否则会出现「关不掉窗口」的假死。
+        if (not self._real_close) and self.cfg.get("minimizeToTray", True) \
+                and self.tray is not None and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray.showMessage(
+                "Git 提交助手",
+                "已缩到系统托盘，定时自动提交继续在后台运行。\n双击托盘图标可重新打开。",
+                QSystemTrayIcon.MessageIcon.Information, 3000)
+            return
+        if self.tray is not None:
+            self.tray.hide()
         event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 
 def run_gui(repo=None):

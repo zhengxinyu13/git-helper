@@ -13,7 +13,8 @@ Git 提交助手 —— PyQt6 图形界面（真玻璃拟态）
 import os
 import sys
 
-from PyQt6.QtCore import QDateTime, QPoint, QRect, QRectF, Qt, QTimer
+from PyQt6.QtCore import (QDateTime, QPoint, QRect, QRectF, QObject, QRunnable,
+                          Qt, QThreadPool, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient,
                          QIcon, QFontDatabase)
@@ -536,6 +537,28 @@ class Msg:
         return "", False
 
 
+# ---------------------------------------------------------------- 后台执行
+# git 命令是子进程调用，在云盘目录里尤其慢（status 要扫一遍工作区）。
+# 直接放在主线程里跑，执行那几百毫秒到几秒里界面是完全卡住的：
+# 拖不动、按钮没反应。所以统一丢到后台线程，主线程只负责收结果刷界面。
+class _TaskSignals(QObject):
+    done = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+
+class _Task(QRunnable):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.signals = _TaskSignals()
+
+    def run(self):
+        try:
+            self.signals.done.emit(self.fn())
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
 class GlassWindow(QWidget):
     """无边框 + 半透明 + 自绘玻璃背景的主窗口。
 
@@ -569,6 +592,13 @@ class GlassWindow(QWidget):
         self._build_ui()
         self._wire_timers()
         self._mark_cloud()
+
+        # 同一仓库上的 git 操作必须串行：两个 git 同时写 .git 会互相踩
+        # （典型后果是 index.lock 报错、提交丢一半）。所以池子里只留 1 条线程。
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self._tasks = []
+        self._pending = 0
 
         # 关键：在窗口 show 之前抓桌面，抓到的才是纯桌面背景（不含自己）
         self.grab_backdrop()
@@ -1207,10 +1237,13 @@ class GlassWindow(QWidget):
                 "将在下面这个目录执行 git init，并把现有文件全部纳入首次提交：\n\n%s" % path) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            ok, msg = init_repo(path)
-        except Exception as e:
-            Msg.critical(self, "初始化失败", str(e))
+        self._run(lambda: init_repo(path),
+                  lambda res: self._after_init(path, res), "初始化仓库…")
+
+    def _after_init(self, path, res):
+        ok, msg = res
+        if not ok:
+            Msg.critical(self, "初始化失败", msg)
             return
         self.repo = path
         self.ed_repo.setText(path)
@@ -1280,6 +1313,49 @@ class GlassWindow(QWidget):
         self.tbl_log.setRowCount(0)
         self.cb_branch.clear()
 
+    # ------------------------------------------------------------ 后台执行
+    def _run(self, fn, on_done=None, busy="执行中…", on_error=None):
+        """把一次 git 操作丢到后台串行执行，结果回到主线程再刷界面。
+
+        注意闭包里只能捕获「已经取出来的值」，不要在子线程里读控件
+        （Qt 的控件只能在主线程碰，跨线程调用会随机崩）。
+        """
+        task = _Task(fn)
+        task.setAutoDelete(False)
+        self._tasks.append(task)          # 持有引用，否则 Python 侧会被提前回收
+        self._pending += 1
+        self.set_status(busy)
+        task.signals.done.connect(lambda r, t=task: self._task_done(t, on_done, r))
+        task.signals.error.connect(lambda e, t=task: self._task_error(t, e, on_error))
+        self.pool.start(task)
+
+    def _task_done(self, task, on_done, result):
+        self._release(task)
+        try:
+            if on_done:
+                on_done(result)
+        except Exception:
+            log_exception(*sys.exc_info())
+            Msg.critical(self, "处理结果失败", "界面更新时出错，详情见 error.log")
+
+    def _task_error(self, task, msg, on_error):
+        self._release(task)
+        if on_error:
+            try:
+                on_error(msg)
+                return
+            except Exception:
+                log_exception(*sys.exc_info())
+        self.set_status("执行失败：" + msg)
+        Msg.critical(self, "执行失败", msg)
+
+    def _release(self, task):
+        self._pending = max(0, self._pending - 1)
+        try:
+            self._tasks.remove(task)
+        except ValueError:
+            pass
+
     # ------------------------------------------------------------ 分支
     def _need_repo(self):
         if not is_repo(self.repo):
@@ -1287,19 +1363,20 @@ class GlassWindow(QWidget):
             return False
         return True
 
+    def _after_simple(self, msg):
+        """分支新建/切换/删除这类「一句话结果」的通用收尾。"""
+        self.set_status(msg)
+        self.refresh()
+
     def do_create_branch(self):
         if not self._need_repo():
             return
         name, ok = Msg.getText(self, "新建分支", "分支名：")
         if not ok or not name.strip():
             return
-        try:
-            msg = create_branch(self.repo, name.strip(), switch=True)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo, nm = self.repo, name.strip()
+        self._run(lambda: create_branch(repo, nm, switch=True),
+                  self._after_simple, "新建分支…")
 
     def do_switch(self):
         if not self._need_repo():
@@ -1308,13 +1385,9 @@ class GlassWindow(QWidget):
         if not name:
             Msg.information(self, "提示", "先在下拉框里选一个分支。")
             return
-        try:
-            msg = switch_branch(self.repo, name)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: switch_branch(repo, name),
+                  self._after_simple, "切换分支…")
 
     def do_merge(self):
         if not self._need_repo():
@@ -1331,22 +1404,22 @@ class GlassWindow(QWidget):
                                 "把「%s」合并进当前分支「%s」？" % (src, cur)) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            r = merge_branch(self.repo, src)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        if r["merged"]:
-            Msg.information(self, "合并完成", r["message"])
-            self.set_status("已合并 %s → %s" % (src, cur))
-        else:
-            cf = r["conflicts"]
-            Msg.warning(
-                self, "合并有冲突",
-                "合并未完成，需要手动解决冲突：\n\n%s\n\n解决后提交，或点「中止合并」回到合并前。"
-                % ("\n".join(cf) if cf else r["message"]))
-            self.set_status("合并冲突：%d 个文件" % len(cf))
-        self.refresh()
+        repo = self.repo
+
+        def done(r):
+            if r["merged"]:
+                Msg.information(self, "合并完成", r["message"])
+                self.set_status("已合并 %s → %s" % (src, cur))
+            else:
+                cf = r["conflicts"]
+                Msg.warning(
+                    self, "合并有冲突",
+                    "合并未完成，需要手动解决冲突：\n\n%s\n\n解决后提交，或点「中止合并」回到合并前。"
+                    % ("\n".join(cf) if cf else r["message"]))
+                self.set_status("合并冲突：%d 个文件" % len(cf))
+            self.refresh()
+
+        self._run(lambda: merge_branch(repo, src), done, "合并中…")
 
     def do_delete_branch(self):
         if not self._need_repo():
@@ -1358,31 +1431,24 @@ class GlassWindow(QWidget):
                                 "删除分支「%s」？\n未合并的改动会丢失，建议先合并。" % name) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            msg = delete_branch(self.repo, name)
-        except Exception as e:
+        repo = self.repo
+
+        def on_error(e):
             if Msg.question(self, "删除失败",
                                     "%s\n\n有未合并的改动。要强制删除吗？" % e) \
                     != QMessageBox.StandardButton.Yes:
                 return
-            try:
-                msg = delete_branch(self.repo, name, force=True)
-            except Exception as e2:
-                Msg.critical(self, "失败", str(e2))
-                return
-        self.set_status(msg)
-        self.refresh()
+            self._run(lambda: delete_branch(repo, name, force=True),
+                      self._after_simple, "强制删除分支…")
+
+        self._run(lambda: delete_branch(repo, name), self._after_simple,
+                  "删除分支…", on_error=on_error)
 
     def do_abort_merge(self):
         if not self._need_repo():
             return
-        try:
-            msg = abort_merge(self.repo)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: abort_merge(repo), self._after_simple, "中止合并…")
 
     # ------------------------------------------------------------ 刷新
     def refresh(self):
@@ -1391,14 +1457,13 @@ class GlassWindow(QWidget):
             self.lbl_chip.setText("未初始化")
             self.lbl_count.setText("（不是 Git 仓库）")
             return
-        try:
-            branch, files = get_status(self.repo)
-            logs = get_log(self.repo, int(self.cfg.get("maxLog", 200)))
-            branches = get_branches(self.repo)
-        except Exception as e:
-            self.set_status("读取仓库失败：%s" % e)
-            return
+        repo, maxlog = self.repo, int(self.cfg.get("maxLog", 200))
+        self._run(lambda: (get_status(repo), get_log(repo, maxlog), get_branches(repo)),
+                  self._apply_refresh, "读取仓库…",
+                  on_error=lambda e: self.set_status("读取仓库失败：%s" % e))
 
+    def _apply_refresh(self, data):
+        (branch, files), logs, branches = data
         keep = set(self.selected_paths())
         self.files, self.logs, self.branches = files, logs, branches
         self.lbl_chip.setText("分支 " + branch)
@@ -1470,13 +1535,14 @@ class GlassWindow(QWidget):
         if not self._need_repo():
             return
         paths = self.selected_paths()
-        try:
-            h, msg, skipped = do_commit(
-                self.repo, self.ed_msg.text(), paths or None,
-                skip_unstable=bool(self.cfg.get("skipUnstable", True)))
-        except Exception as e:
-            Msg.critical(self, "提交失败", str(e))
-            return
+        text = self.ed_msg.text()          # 控件只能在主线程读，先把值取出来
+        repo = self.repo
+        skip = bool(self.cfg.get("skipUnstable", True))
+        self._run(lambda: do_commit(repo, text, paths or None, skip_unstable=skip),
+                  self._after_commit, "提交中…")
+
+    def _after_commit(self, res):
+        h, msg, skipped = res
         if h:
             self.ed_msg.clear()
             self._report_skipped(skipped, "已提交 %s：%s" % (h[:7], msg))
@@ -1511,15 +1577,27 @@ class GlassWindow(QWidget):
                 "把选中的 %d 个文件还原到最近一次提交的状态？\n未保存的改动会丢失。\n\n%s"
                 % (len(paths), "\n".join(paths[:12]))) != QMessageBox.StandardButton.Yes:
             return
-        backup = create_backup(self.repo)
-        for p in paths:
-            try:
-                restore_file(self.repo, p)
-            except Exception as e:
-                Msg.critical(self, "还原失败", "%s\n%s" % (p, e))
-                break
-        self.set_status("已还原 %d 个文件（备份分支：%s）" % (len(paths), backup or "无"))
-        self.refresh()
+        repo = self.repo
+
+        def job():
+            backup = create_backup(repo)
+            errs = []
+            for p in paths:
+                try:
+                    restore_file(repo, p)
+                except Exception as e:
+                    errs.append("%s：%s" % (p, e))
+            return backup, errs
+
+        def done(res):
+            backup, errs = res
+            if errs:
+                Msg.critical(self, "还原失败", "\n".join(errs))
+            self.set_status("已还原 %d 个文件（备份分支：%s）"
+                            % (len(paths) - len(errs), backup or "无"))
+            self.refresh()
+
+        self._run(job, done, "还原文件…")
 
     def discard_all(self):
         if not self._need_repo():
@@ -1533,29 +1611,24 @@ class GlassWindow(QWidget):
         if Msg.question(self, "再次确认", "真的要丢弃全部未提交改动吗？") \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            backup = discard_all(self.repo)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status("已撤销全部未提交改动（备份分支：%s）" % (backup or "无"))
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: discard_all(repo),
+                  lambda backup: (
+                      self.set_status("已撤销全部未提交改动（备份分支：%s）" % (backup or "无")),
+                      self.refresh()),
+                  "撤销改动…")
 
     def show_commit_diff(self):
         h = self.sel_hash()
         if not h:
             Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
-        try:
-            self.set_diff(get_diff(self.repo, "commit", h))
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
+        repo = self.repo
+        self._run(lambda: get_diff(repo, "commit", h), self.set_diff, "读取差异…")
 
     def show_diff(self, kind):
-        try:
-            self.set_diff(get_diff(self.repo, kind))
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
+        repo = self.repo
+        self._run(lambda: get_diff(repo, kind), self.set_diff, "读取差异…")
 
     def revert_commit(self):
         h = self.sel_hash()
@@ -1567,13 +1640,8 @@ class GlassWindow(QWidget):
                 "生成一次「反向提交」来抵消 %s 的改动。\n历史记录完整保留，可再次撤销。\n\n继续？" % h[:7]) \
                 != QMessageBox.StandardButton.Yes:
             return
-        try:
-            msg = revert_commit(self.repo, h)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status(msg)
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: revert_commit(repo, h), self._after_simple, "反向撤销…")
 
     def reset_to_commit(self):
         h = self.sel_hash()
@@ -1595,13 +1663,13 @@ class GlassWindow(QWidget):
         if not ok:
             return
         mode = mode.split()[0]
-        try:
-            backup = reset_to(self.repo, h, mode)
-        except Exception as e:
-            Msg.critical(self, "失败", str(e))
-            return
-        self.set_status("已回退到 %s（%s，备份分支：%s）" % (h[:7], mode, backup or "无"))
-        self.refresh()
+        repo = self.repo
+        self._run(lambda: reset_to(repo, h, mode),
+                  lambda backup: (
+                      self.set_status("已回退到 %s（%s，备份分支：%s）"
+                                      % (h[:7], mode, backup or "无")),
+                      self.refresh()),
+                  "回退中…")
 
     # ------------------------------------------------------------ 定时
     def on_schedule_change(self, *_a):
@@ -1621,29 +1689,33 @@ class GlassWindow(QWidget):
         self.auto_tick()
 
     def auto_tick(self):
-        try:
-            if self.cfg.get("autoEnabled") and is_repo(self.repo):
-                now_ms = QDateTime.currentMSecsSinceEpoch()
-                need = max(1, int(self.cfg.get("intervalHours", 1))) * 3600 * 1000
-                if now_ms - int(self.cfg.get("lastRunAt", 0)) >= need:
-                    h, msg, skipped = do_commit(
-                        self.repo, None, None,
-                        skip_unstable=bool(self.cfg.get("skipUnstable", True)))
-                    if h:
-                        self.cfg["lastRunAt"] = now_ms
-                        self._report_skipped(skipped,
-                                             "自动提交完成 %s：%s" % (h[:7], msg))
-                        self.refresh()
-                    else:
-                        # 有文件还在写入 → 5 分钟后补交，别干等一整个周期；
-                        # 单纯无变更 → 照常计时。
-                        self.cfg["lastRunAt"] = (now_ms - need + RETRY_MS
-                                                 if skipped else now_ms)
-                        self._report_skipped(skipped,
-                                             "自动提交检查：" + (msg or "无变更"))
-                    save_config(self.cfg)
-        except Exception as e:
-            self.set_status("自动提交失败：%s" % e)
+        if not (self.cfg.get("autoEnabled") and is_repo(self.repo)):
+            return
+        now_ms = QDateTime.currentMSecsSinceEpoch()
+        need = max(1, int(self.cfg.get("intervalHours", 1))) * 3600 * 1000
+        if now_ms - int(self.cfg.get("lastRunAt", 0)) < need:
+            return
+        repo = self.repo
+        skip = bool(self.cfg.get("skipUnstable", True))
+        self._run(lambda: do_commit(repo, None, None, skip_unstable=skip),
+                  lambda res: self._after_auto(res, now_ms, need), "自动提交…",
+                  on_error=lambda e: self.set_status("自动提交失败：" + e))
+
+    def _after_auto(self, res, now_ms, need):
+        h, msg, skipped = res
+        if h:
+            self.cfg["lastRunAt"] = now_ms
+            self._report_skipped(skipped,
+                                 "自动提交完成 %s：%s" % (h[:7], msg))
+            self.refresh()
+        else:
+            # 有文件还在写入 → 5 分钟后补交，别干等一整个周期；
+            # 单纯无变更 → 照常计时。
+            self.cfg["lastRunAt"] = (now_ms - need + RETRY_MS
+                                     if skipped else now_ms)
+            self._report_skipped(skipped,
+                                 "自动提交检查：" + (msg or "无变更"))
+        save_config(self.cfg)
 
     def closeEvent(self, event):
         save_config(self.cfg)

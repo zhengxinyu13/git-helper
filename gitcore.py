@@ -139,6 +139,10 @@ DEFAULT_CONFIG = {
     "stableSeconds": 120,
     # 已经提示过「此仓库在云盘目录里」的路径，避免每次启动都弹一次。
     "cloudWarnedFor": "",
+    # 关窗口时缩到系统托盘后台运行（定时自动提交照旧生效），而不是直接退出。
+    "minimizeToTray": True,
+    # 开机自启。写的是 HKCU 的 Run 项，不需要管理员权限。
+    "launchAtLogin": False,
 }
 
 
@@ -479,6 +483,58 @@ def filter_stable(repo, files, stable_seconds=None):
         else:
             kept.append(f)
     return kept, skipped
+
+
+# ---------------------------------------------------------------- 开机自启
+# 写在 HKCU（当前用户）下，不需要管理员权限，也不会影响别的账号。
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "Git 提交助手"
+
+
+def _exe_path():
+    """开机自启要启动的那个程序路径。源码模式返回 None（不给 Python 脚本登记）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return None
+
+
+def get_launch_at_login():
+    """读注册表里有没有登记开机自启。读不到就当没开。"""
+    if platform.system() != "Windows":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, RUN_NAME)
+            return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def set_launch_at_login(enable):
+    """登记 / 取消开机自启。返回是否真的改成了。"""
+    if platform.system() != "Windows":
+        return False
+    import winreg
+    exe = _exe_path()
+    if not exe:
+        return False
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            if enable:
+                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ,
+                                  '"%s"' % os.path.normpath(exe))
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_NAME)
+                except OSError:
+                    pass
+        return True
+    except Exception:
+        return False
 
 
 def _add_paths(repo, paths, batch=200):

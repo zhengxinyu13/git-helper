@@ -22,17 +22,19 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                              QComboBox, QDialog, QFileDialog, QFrame,
                              QGraphicsBlurEffect,
                              QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMessageBox, QPushButton, QSizeGrip,
-                             QSplitter, QTableWidget, QTableWidgetItem,
+                             QLineEdit, QMenu, QMessageBox, QPushButton,
+                             QSizeGrip, QSplitter, QSystemTrayIcon,
+                             QTableWidget, QTableWidgetItem,
                              QTextEdit, QVBoxLayout, QWidget)
 
 from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      create_branch, delete_branch, discard_all, do_commit,
                      get_branches, get_diff, get_log, get_status, git,
-                     ensure_gitignore, init_repo, is_cloud_dir, is_repo,
-                     load_config, log_exception, merge_branch, abort_merge,
-                     remember_repo, reset_to, restore_file, revert_commit,
-                     save_config, switch_branch)
+                     ensure_gitignore, get_launch_at_login, init_repo,
+                     is_cloud_dir, is_repo, load_config, log_exception,
+                     merge_branch, abort_merge, remember_repo, reset_to,
+                     restore_file, revert_commit, save_config,
+                     set_launch_at_login, switch_branch)
 
 # ---------------------------------------------------------------- 配色
 CARD_BORDER = "rgba(255, 255, 255, 0.85)"
@@ -599,6 +601,8 @@ class GlassWindow(QWidget):
         self.pool.setMaxThreadCount(1)
         self._tasks = []
         self._pending = 0
+        self._real_close = False          # 托盘菜单「退出」时置 True，绕开缩托盘
+        self._init_tray()
 
         # 关键：在窗口 show 之前抓桌面，抓到的才是纯桌面背景（不含自己）
         self.grab_backdrop()
@@ -607,6 +611,102 @@ class GlassWindow(QWidget):
         QTimer.singleShot(200, self.refresh)
         QTimer.singleShot(1500, self.auto_tick)
         QTimer.singleShot(2000, self._warn_cloud)
+
+    # ------------------------------------------------------------ 系统托盘
+    def _init_tray(self):
+        """托盘常驻：关掉窗口只是藏起来，定时自动提交继续在后台跑。
+
+        这是「自动提交」能真正自动的前提 —— 否则窗口一关，定时器就没了。
+        """
+        self.tray = None
+        # 开机自启以注册表为准（配置可能和真实状态不同步），托盘可用与否都要同步
+        if hasattr(self, "chk_boot"):
+            self.chk_boot.blockSignals(True)
+            self.chk_boot.setChecked(get_launch_at_login())
+            self.chk_boot.blockSignals(False)
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon_path = os.path.join(RES, "app.ico")
+        self.tray = QSystemTrayIcon(QIcon(icon_path) if os.path.exists(icon_path)
+                                    else QIcon(), self)
+        self.tray.setToolTip("Git 提交助手")
+
+        menu = QMenu()
+        menu.setStyleSheet(
+            "QMenu { background: #fbfcfe; border: 1px solid rgba(120,132,156,0.35);"
+            " border-radius: 10px; padding: 6px; }"
+            "QMenu::item { padding: 6px 22px; border-radius: 6px; color: #2f3742; }"
+            "QMenu::item:selected { background: #e7efff; }")
+
+        act_show = menu.addAction("打开主界面")
+        act_show.triggered.connect(self._tray_show)
+        act_now = menu.addAction("立即提交")
+        act_now.triggered.connect(self.run_now)
+        menu.addSeparator()
+        self.act_boot = menu.addAction("开机自启")
+        self.act_boot.setCheckable(True)
+        self.act_boot.setChecked(get_launch_at_login())
+        self.act_boot.triggered.connect(self._toggle_boot)
+        menu.addSeparator()
+        act_quit = menu.addAction("退出")
+        act_quit.triggered.connect(self._tray_quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+        # 窗口藏起来时不能让 Qt 认为「最后一个窗口关了」而直接退出程序
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+
+    def _tray_show(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.grab_backdrop()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
+                      QSystemTrayIcon.ActivationReason.Trigger):
+            self._tray_show()
+
+    def _apply_boot(self, checked):
+        """开机自启总入口：写 HKCU 的 Run 项，并把状态栏和托盘菜单两处开关同步。
+
+        开机自启只对打包后的 exe 生效 —— 源码模式没有可登记的程序路径。
+        """
+        widgets = [getattr(self, "act_boot", None), getattr(self, "chk_boot", None)]
+        if not set_launch_at_login(checked):
+            for wgt in widgets:
+                if wgt is None:
+                    continue
+                wgt.blockSignals(True)
+                wgt.setChecked(False)
+                wgt.blockSignals(False)
+            Msg.information(
+                self, "未能设置",
+                "开机自启只对打包后的程序生效（源码模式没有可登记的程序路径）。")
+            return
+        self.cfg["launchAtLogin"] = checked
+        save_config(self.cfg)
+        for wgt in widgets:
+            if wgt is None:
+                continue
+            wgt.blockSignals(True)
+            wgt.setChecked(checked)
+            wgt.blockSignals(False)
+        self.set_status("开机自启已%s" % ("开启" if checked else "关闭"))
+
+    def _toggle_boot(self, checked):
+        self._apply_boot(checked)
+
+    def on_boot_change(self, *_a):
+        self._apply_boot(self.chk_boot.isChecked())
+
+    def _tray_quit(self):
+        self._real_close = True
+        self.close()
 
     def _center_on_screen(self):
         try:
@@ -1123,6 +1223,21 @@ class GlassWindow(QWidget):
         row.addWidget(self.lbl_status)
         row.addStretch(1)
 
+        self.chk_tray = QCheckBox("缩到托盘")
+        self.chk_tray.setChecked(bool(self.cfg.get("minimizeToTray", True)))
+        self.chk_tray.setToolTip(
+            "关闭窗口时只藏到系统托盘，定时自动提交继续在后台跑。\n"
+            "取消勾选后，关窗口就是真正退出（自动提交随之停止）。")
+        self.chk_tray.stateChanged.connect(self.on_tray_change)
+        row.addWidget(self.chk_tray)
+        row.addSpacing(10)
+
+        self.chk_boot = QCheckBox("开机自启")
+        self.chk_boot.setToolTip("登录 Windows 后自动启动（登记在「当前用户」的启动项里）。")
+        self.chk_boot.stateChanged.connect(self.on_boot_change)
+        row.addWidget(self.chk_boot)
+        row.addSpacing(12)
+
         lb = QLabel("玻璃浓度")
         lb.setObjectName("muted")
         row.addWidget(lb)
@@ -1161,6 +1276,13 @@ class GlassWindow(QWidget):
             app.setStyleSheet(build_qss(name))
         self.grab_backdrop()
         self.set_status("玻璃浓度已切换为：%s（已记住，下次启动沿用）" % name)
+
+    def on_tray_change(self, *_a):
+        on = self.chk_tray.isChecked()
+        self.cfg["minimizeToTray"] = on
+        save_config(self.cfg)
+        self.set_status("关闭窗口时：%s"
+                        % ("缩到托盘，后台继续自动提交" if on else "直接退出程序"))
 
     def on_safe_change(self, *_a):
         self.cfg["skipUnstable"] = self.chk_safe.isChecked()
@@ -1719,7 +1841,23 @@ class GlassWindow(QWidget):
 
     def closeEvent(self, event):
         save_config(self.cfg)
+        # 关窗口 = 缩到托盘（默认）。只有托盘真的在、且用户没点「退出」时才这么做，
+        # 否则会出现「关不掉窗口」的假死。
+        if (not self._real_close) and self.cfg.get("minimizeToTray", True) \
+                and self.tray is not None and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray.showMessage(
+                "Git 提交助手",
+                "已缩到系统托盘，定时自动提交继续在后台运行。\n双击托盘图标可重新打开。",
+                QSystemTrayIcon.MessageIcon.Information, 3000)
+            return
+        if self.tray is not None:
+            self.tray.hide()
         event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 
 def run_gui(repo=None):

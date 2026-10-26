@@ -142,8 +142,9 @@ def cli_main(argv=None):
 
         elif args.cmd == "commit":
             need_repo()
-            h, msg = do_commit(repo, args.message, args.paths)
-            out = {"ok": True, "committed": bool(h), "hash": h, "message": msg}
+            h, msg, skipped = do_commit(repo, args.message, args.paths)
+            out = {"ok": True, "committed": bool(h), "hash": h, "message": msg,
+                   "skipped": skipped}
 
         elif args.cmd == "diff":
             need_repo()
@@ -205,12 +206,14 @@ def cli_main(argv=None):
                 cfg["lastRunAt"] = 0
             save_config(cfg)
             h = msg = None
+            skipped = []
             if args.run_now and is_repo(repo):
-                h, msg = do_commit(repo, None, None)
+                h, msg, skipped = do_commit(repo, None, None)
             out = {"ok": True,
                    "config": {"autoEnabled": cfg["autoEnabled"],
                               "intervalHours": cfg["intervalHours"]},
-                   "committed": bool(h), "hash": h, "message": msg}
+                   "committed": bool(h), "hash": h, "message": msg,
+                   "skipped": skipped}
     except Exception as e:
         out = {"ok": False, "error": str(e)}
 

@@ -28,9 +28,9 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      create_branch, delete_branch, discard_all, do_commit,
                      get_branches, get_diff, get_log, get_status, git,
-                     init_repo, is_repo, load_config, log_exception, merge_branch,
-                     abort_merge, remember_repo, reset_to, restore_file,
-                     revert_commit, save_config, switch_branch)
+                     init_repo, is_cloud_dir, is_repo, load_config, log_exception,
+                     merge_branch, abort_merge, remember_repo, reset_to,
+                     restore_file, revert_commit, save_config, switch_branch)
 
 # ---------------------------------------------------------------- 配色
 CARD_BORDER = "rgba(255, 255, 255, 0.85)"
@@ -55,6 +55,10 @@ GLASS_LEVELS = {
              "field": "0.97", "table": "0.90", "head": "0.86", "glow": 0.2},
 }
 # 默认取「沉稳」：复杂桌面下不刺眼，同时还能看出背景轮廓，玻璃感仍在。
+
+# 自动提交撞上「文件还在写入」时，隔多久补一次（毫秒）。
+# 太短会每分钟重试一次、状态栏一直跳；太长就失去「等它写完再交」的意义。
+RETRY_MS = 5 * 60 * 1000
 DEFAULT_GLASS = "沉稳"
 TEXT = "#1f2937"
 MUTED = "#7b8494"
@@ -91,6 +95,13 @@ QLabel#chip {{
 }}
 QLabel#muted {{
     color: {muted};
+    font-size: 8pt;
+}}
+QLabel#chipWarn {{
+    color: #8a5300;
+    background: rgba(250, 199, 117, 0.55);
+    border-radius: 8px;
+    padding: 2px 8px;
     font-size: 8pt;
 }}
 QLabel#groupTitle {{
@@ -556,6 +567,7 @@ class GlassWindow(QWidget):
 
         self._build_ui()
         self._wire_timers()
+        self._mark_cloud()
 
         # 关键：在窗口 show 之前抓桌面，抓到的才是纯桌面背景（不含自己）
         self.grab_backdrop()
@@ -563,6 +575,7 @@ class GlassWindow(QWidget):
         # 启动后立刻读一次仓库，不用干等第一个 20 秒轮询
         QTimer.singleShot(200, self.refresh)
         QTimer.singleShot(1500, self.auto_tick)
+        QTimer.singleShot(2000, self._warn_cloud)
 
     def _center_on_screen(self):
         try:
@@ -836,9 +849,23 @@ class GlassWindow(QWidget):
         self.btn_runnow.clicked.connect(self.run_now)
         bar.addWidget(self.btn_runnow)
 
+        self.chk_safe = QCheckBox("跳过写入中")
+        self.chk_safe.setChecked(bool(self.cfg.get("skipUnstable", True)))
+        self.chk_safe.setToolTip(
+            "提交时跳过三类文件：Office/WPS 的 ~$ 锁文件、正被 Office 打开的文档、"
+            "以及 2 分钟内刚改过的文件（云盘可能还没同步完）。\n"
+            "取消勾选 = 回到原来的「全部 add 进去」。")
+        self.chk_safe.stateChanged.connect(self.on_safe_change)
+        bar.addWidget(self.chk_safe)
+
         self.lbl_last = QLabel("")
         self.lbl_last.setObjectName("muted")
         bar.addWidget(self.lbl_last)
+
+        self.lbl_cloud = QLabel("")
+        self.lbl_cloud.setObjectName("chipWarn")
+        self.lbl_cloud.setVisible(False)
+        bar.addWidget(self.lbl_cloud)
 
         bar.addStretch(1)
 
@@ -1098,6 +1125,12 @@ class GlassWindow(QWidget):
         self.grab_backdrop()
         self.set_status("玻璃浓度已切换为：%s（已记住，下次启动沿用）" % name)
 
+    def on_safe_change(self, *_a):
+        self.cfg["skipUnstable"] = self.chk_safe.isChecked()
+        save_config(self.cfg)
+        self.set_status("跳过写入中的文件：%s"
+                        % ("开启" if self.cfg["skipUnstable"] else "关闭（全部提交）"))
+
     def _wire_timers(self):
         self.timer_refresh = QTimer(self)
         self.timer_refresh.timeout.connect(self.refresh)
@@ -1137,11 +1170,13 @@ class GlassWindow(QWidget):
                                 "目录不存在：\n%s\n\n点「初始化此目录并首次提交」可以创建它。" % path)
             return
         self.repo = path
+        self._mark_cloud()
         if is_repo(path):
             remember_repo(self.cfg, path)
             self.update_recent()
             self.set_status("已打开仓库：%s" % path)
             self.refresh()
+            self._warn_cloud()
         else:
             self.set_status("该目录不是 Git 仓库，点「初始化此目录并首次提交」即可。")
             self.clear_views()
@@ -1172,11 +1207,45 @@ class GlassWindow(QWidget):
             return
         self.repo = path
         self.ed_repo.setText(path)
+        self._mark_cloud()
         remember_repo(self.cfg, path)
         self.update_recent()
         Msg.information(self, "完成", msg)
         self.set_status(msg)
         self.refresh()
+        self._warn_cloud()
+
+    def _mark_cloud(self):
+        """仓库在云盘同步目录里时，标题栏挂一个提示标签。"""
+        cloud = is_cloud_dir(self.repo)
+        if not cloud:
+            self.lbl_cloud.setVisible(False)
+            return
+        self.lbl_cloud.setText("云盘目录 · %s" % cloud)
+        self.lbl_cloud.setToolTip(
+            "这个仓库在 %s 的同步目录里：\n"
+            "git 每次写入都会让云盘同步一批 .git 小文件，两边同时改同一文件时\n"
+            "还可能交到没同步完的半成品。已默认开启「跳过写入中」来规避。" % cloud)
+        self.lbl_cloud.setVisible(True)
+
+    def _warn_cloud(self):
+        """云盘目录里的仓库，每个路径只提示一次，避免每次启动都弹窗。"""
+        cloud = is_cloud_dir(self.repo)
+        if not cloud or self.cfg.get("cloudWarnedFor") == self.repo:
+            return
+        self.cfg["cloudWarnedFor"] = self.repo
+        save_config(self.cfg)
+        Msg.information(
+            self, "仓库位于云同步目录",
+            "当前仓库在 %s 的同步目录里：\n\n%s\n\n"
+            "git 每次写入都会触发云盘同步一批 .git 小文件；两边同时改同一个文件时，"
+            "还可能把没同步完的半成品交进去。\n\n"
+            "程序这边已经做了两件事：\n"
+            "1. 默认开启「跳过写入中」：刚改过 2 分钟内的、正被 Office 打开的文档，"
+            "不进本次提交；\n"
+            "2. 5 分钟后自动补交，不用你手动管。\n\n"
+            "建议你再做一步：在云盘客户端里把这个仓库的 .git 目录排除同步"
+            "（如果客户端有过滤规则的话）。" % (cloud, self.repo))
 
     def clear_views(self):
         self.files, self.logs, self.branches = [], [], []
@@ -1375,17 +1444,29 @@ class GlassWindow(QWidget):
             return
         paths = self.selected_paths()
         try:
-            h, msg = do_commit(self.repo, self.ed_msg.text(), paths or None)
+            h, msg, skipped = do_commit(
+                self.repo, self.ed_msg.text(), paths or None,
+                skip_unstable=bool(self.cfg.get("skipUnstable", True)))
         except Exception as e:
             Msg.critical(self, "提交失败", str(e))
             return
         if h:
             self.ed_msg.clear()
-            self.set_status("已提交 %s：%s" % (h[:7], msg))
+            self._report_skipped(skipped, "已提交 %s：%s" % (h[:7], msg))
         else:
-            self.set_status(msg)
+            self._report_skipped(skipped, msg)
             Msg.information(self, "无需提交", msg)
         self.refresh()
+
+    def _report_skipped(self, skipped, base):
+        """把「本次跳过了哪些文件、为什么」接到状态栏文案后面。"""
+        if not skipped:
+            self.set_status(base)
+            return
+        head = skipped[0]
+        more = "等 %d 个文件" % len(skipped) if len(skipped) > 1 else ""
+        self.set_status("%s（跳过 %s：%s %s）"
+                        % (base, head["path"], head["reason"], more))
 
     def sel_all(self):
         self.tbl_files.selectAll()
@@ -1518,14 +1599,22 @@ class GlassWindow(QWidget):
                 now_ms = QDateTime.currentMSecsSinceEpoch()
                 need = max(1, int(self.cfg.get("intervalHours", 1))) * 3600 * 1000
                 if now_ms - int(self.cfg.get("lastRunAt", 0)) >= need:
-                    self.cfg["lastRunAt"] = now_ms
-                    save_config(self.cfg)
-                    h, msg = do_commit(self.repo, None, None)
+                    h, msg, skipped = do_commit(
+                        self.repo, None, None,
+                        skip_unstable=bool(self.cfg.get("skipUnstable", True)))
                     if h:
-                        self.set_status("自动提交完成 %s：%s" % (h[:7], msg))
+                        self.cfg["lastRunAt"] = now_ms
+                        self._report_skipped(skipped,
+                                             "自动提交完成 %s：%s" % (h[:7], msg))
                         self.refresh()
                     else:
-                        self.set_status("自动提交检查：无变更，跳过")
+                        # 有文件还在写入 → 5 分钟后补交，别干等一整个周期；
+                        # 单纯无变更 → 照常计时。
+                        self.cfg["lastRunAt"] = (now_ms - need + RETRY_MS
+                                                 if skipped else now_ms)
+                        self._report_skipped(skipped,
+                                             "自动提交检查：" + (msg or "无变更"))
+                    save_config(self.cfg)
         except Exception as e:
             self.set_status("自动提交失败：%s" % e)
 

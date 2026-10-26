@@ -1153,8 +1153,8 @@ class GlassWindow(QWidget):
         t.setObjectName("groupTitle")
         head2.addWidget(t)
         head2.addStretch(1)
-        for txt, fn, danger in (("查看差异", self.show_commit_diff, False),
-                                ("反向撤销", self.revert_commit, False),
+        # 「查看差异」按钮已去掉：点历史里任意一条提交，下方差异区直接显示它的改动
+        for txt, fn, danger in (("反向撤销", self.revert_commit, False),
                                 ("回退到此", self.reset_to_commit, True)):
             b = QPushButton(txt)
             if danger:
@@ -1178,6 +1178,8 @@ class GlassWindow(QWidget):
         hh2.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         hh2.resizeSection(2, 218)
         hh2.setHighlightSections(False)
+        # 选中即显示差异：点一下（或用方向键移动）就把这次提交的内容铺到下方
+        self.tbl_log.itemSelectionChanged.connect(self.on_log_selected)
         rv.addWidget(self.tbl_log, 1)
 
         split.addWidget(left)
@@ -1195,9 +1197,9 @@ class GlassWindow(QWidget):
         dv.setSpacing(8)
 
         head3 = QHBoxLayout()
-        t = QLabel("差异预览")
-        t.setObjectName("groupTitle")
-        head3.addWidget(t)
+        self.lbl_diff_title = QLabel("差异预览")
+        self.lbl_diff_title.setObjectName("groupTitle")
+        head3.addWidget(self.lbl_diff_title)
         head3.addStretch(1)
         for txt, kind in (("未暂存改动", "unstaged"), ("已暂存改动", "staged")):
             b = QPushButton(txt)
@@ -1211,7 +1213,8 @@ class GlassWindow(QWidget):
         mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         mono.setPointSize(9)
         self.txt_diff.setFont(mono)
-        self.txt_diff.setPlainText("选中一次提交后点「查看差异」，或点右上两个按钮看工作区改动。")
+        self.txt_diff.setPlainText("在上方历史里点任意一次提交，这里就显示它的改动；"
+                                   "或点右上两个按钮看工作区改动。")
         dv.addWidget(self.txt_diff, 1)
         body.addWidget(diffcard, 2)
         return body
@@ -1587,6 +1590,7 @@ class GlassWindow(QWidget):
     def _apply_refresh(self, data):
         (branch, files), logs, branches = data
         keep = set(self.selected_paths())
+        keep_hash = self.sel_hash()       # 重建前记下正在看哪次提交
         self.files, self.logs, self.branches = files, logs, branches
         self.lbl_chip.setText("分支 " + branch)
 
@@ -1622,6 +1626,18 @@ class GlassWindow(QWidget):
             self.tbl_log.setItem(r, 2,
                                  QTableWidgetItem("%s · %s" % (c["author"], short_date)))
             self.tbl_log.item(r, 0).setData(Qt.ItemDataRole.UserRole, c["hash"])
+
+        # 定时刷新会重建列表，选中随之丢失。既然差异区是「选中哪条就看哪条」，
+        # 这里按 hash 把选中接回同一条提交，避免下方内容和上方高亮对不上。
+        # blockSignals 是必要的：否则会再触发一次差异加载。
+        if keep_hash:
+            for r in range(self.tbl_log.rowCount()):
+                it = self.tbl_log.item(r, 0)
+                if it is not None and it.data(Qt.ItemDataRole.UserRole) == keep_hash:
+                    self.tbl_log.blockSignals(True)
+                    self.tbl_log.selectRow(r)
+                    self.tbl_log.blockSignals(False)
+                    break
 
         last = self.cfg.get("lastRunAt", 0)
         self.lbl_last.setText(
@@ -1740,16 +1756,30 @@ class GlassWindow(QWidget):
                       self.refresh()),
                   "撤销改动…")
 
+    def on_log_selected(self):
+        """在提交历史里点中某一条 → 差异区直接显示这次提交的内容。
+
+        刷新会重建表格并清空选中，那时 sel_hash() 返回 None，直接跳过，
+        不要把差异区清成空（用户可能正在看上一次的内容）。
+        """
+        h = self.sel_hash()
+        if not h:
+            return
+        self.show_commit_diff()
+
     def show_commit_diff(self):
         h = self.sel_hash()
         if not h:
             Msg.information(self, "提示", "先在历史列表里选中一次提交。")
             return
         repo = self.repo
+        self.lbl_diff_title.setText("差异预览 · %s" % h[:7])
         self._run(lambda: get_diff(repo, "commit", h), self.set_diff, "读取差异…")
 
     def show_diff(self, kind):
         repo = self.repo
+        label = "未暂存改动" if kind == "unstaged" else "已暂存改动"
+        self.lbl_diff_title.setText("差异预览 · %s" % label)
         self._run(lambda: get_diff(repo, kind), self.set_diff, "读取差异…")
 
     def revert_commit(self):

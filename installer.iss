@@ -91,7 +91,9 @@ ExitSetupTitle=退出安装
 ExitSetupMessage=安装尚未完成。如果现在退出，[name] 将不会被安装。%n%n你可以稍后再次运行安装程序来完成安装。
 
 [Tasks]
-Name: "desktopicon"; Description: "在桌面创建快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
+; 桌面快捷方式默认勾上：全新安装会创建；升级时由下面 [Icons] 的 Check 决定
+; （已存在就不重写，从而保住图标位置）。
+Name: "desktopicon"; Description: "在桌面创建快捷方式"; GroupDescription: "附加任务:"
 Name: "addtopath"; Description: "把命令行版加入 PATH（供脚本 / AI 调用）"; GroupDescription: "附加任务:"; Flags: unchecked
 
 [Files]
@@ -107,7 +109,12 @@ Source: "gui_main.py"; DestDir: "{app}\source"; Flags: ignoreversion
 Name: "{group}\Git 提交助手"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
 Name: "{group}\命令行版（CLI）使用说明"; Filename: "{app}\{#MyCliExeName}"; Parameters: "help"; IconFilename: "{app}\app.ico"
 Name: "{group}\卸载 Git 提交助手"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Git 提交助手"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
+; 关键：桌面图标已存在时绝不重写。资源管理器按「项目」记图标位置，
+; .lnk 一被覆盖写就当成新项目，位置记忆失效，图标会掉到左上角第一个空位。
+; 所以这里用 Check 兜住——存在就跳过，位置原样保留。
+; 代价：这一条不会被写进卸载记录，卸载后可能残留一个失效的桌面图标。
+Name: "{autodesktop}\Git 提交助手"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; \
+    Tasks: desktopicon; Check: not DesktopIconExists
 
 [Registry]
 ; 命令行版加入 PATH：追加到用户级 PATH，不改动系统 PATH
@@ -137,6 +144,12 @@ begin
     Result := '';
 end;
 
+{ 桌面快捷方式是否已经存在。存在就不重写，保住图标位置。 }
+function DesktopIconExists(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{autodesktop}\{#MyAppName}.lnk'));
+end;
+
 procedure InitializeWizard();
 var
   i: Integer;
@@ -151,20 +164,17 @@ begin
   WizardForm.WelcomeLabel2.Caption :=
     '这台电脑上已经装有 {#MyAppName} ' + OldVersion + '，即将升级到 {#MyAppVersion}。' + #13#10 + #13#10 +
     '升级只替换程序文件：你的最近仓库记录、自动提交设置、玻璃浓度都会保留，' + #13#10 +
-    '桌面和开始菜单的快捷方式也不会被删除或移动。';
+    '桌面图标的位置、开始菜单的快捷方式都不会被删除或移动。';
   WizardForm.FinishedHeadingLabel.Caption := '{#MyAppName} 升级完成';
   WizardForm.FinishedLabel.Caption :=
     '已升级到 {#MyAppVersion}。你的个人设置和快捷方式都原样保留。';
 
-  { 桌面快捷方式已经存在就把这个任务勾上：
-    一是位置不会动（不会删掉重建），二是新的卸载记录里能记上它 }
+  { 桌面快捷方式已经存在 → 取消勾选，本升级不会去碰它，图标位置原地不动。
+    不存在才勾上，让 [Icons] 建一个新的。 }
   for i := 0 to WizardForm.TasksList.Items.Count - 1 do
   begin
     if Pos('桌面', WizardForm.TasksList.ItemCaption[i]) > 0 then
-    begin
-      if FileExists(ExpandConstant('{autodesktop}\{#MyAppName}.lnk')) then
-        WizardForm.TasksList.Checked[i] := True;
-    end;
+      WizardForm.TasksList.Checked[i] := not DesktopIconExists();
   end;
 end;
 

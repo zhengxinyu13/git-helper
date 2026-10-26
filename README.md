@@ -17,11 +17,19 @@ Windows 上的 Git 图形化小工具：毛玻璃界面，能一键提交、按�
 1. **安装包**（推荐）：下载 `Git提交助手-Setup-<版本>.exe` 双击运行，按向导走完即可。
    卸载走「控制面板 → 程序和功能」，或用安装目录下的 `unins000.exe`。
 2. **免安装**：直接取 `dist/Git提交助手.exe` 双击运行，不需要装 Python。
-   程序配置（默认仓库、自动提交开关）保存在 exe 同目录的 `config.json`。
+   程序配置（默认仓库、自动提交开关、玻璃浓度）保存在
+   `%APPDATA%\Git 提交助手\config.json`，升级或重装都不会丢。
 
 ## 功能
 
 - **提交**：勾选文件后提交，或定时自动提交（默认 1 小时，可在界面开关）
+- **提交保护**：默认跳过 `~$` 锁文件、正被 Office 打开的文档、2 分钟内刚改过的文件；
+  按 `Office 锁文件 / 临时文件 / 云盘冲突副本` 等 14 条默认规则过滤，
+  点「忽略规则」可在已有仓库里一键补齐 `.gitignore`
+- **云盘提示**：仓库落在坚果云 / OneDrive / Dropbox 等同步目录里时会提醒，
+  并自动开启上面的提交保护
+- **后台常驻**：关闭窗口默认缩到系统托盘，定时自动提交继续生效；
+  可选开机自启（写在「当前用户」启动项里，不需要管理员权限）
 - **回退**：反向撤销某个 commit、回退到指定 commit（soft / mixed / hard）、单文件还原、
   撤销全部未提交改动 —— 破坏性操作前会自动创建 `backup/before-rollback-<时间戳>` 分支
 - **分支**：新建 / 切换 / 合并（带冲突检测）/ 删除 / 中止合并
@@ -44,6 +52,7 @@ GitHelper-CLI.exe branch --list               # 分支列表
 GitHelper-CLI.exe branch --create feature/x   # 建分支并切换
 GitHelper-CLI.exe merge feature/x             # 合并分支
 GitHelper-CLI.exe init <路径>                 # 初始化仓库并首次提交
+GitHelper-CLI.exe ignore                      # 生成/补齐 .gitignore 默认忽略规则
 GitHelper-CLI.exe use <路径>                  # 设为默认仓库
 GitHelper-CLI.exe -C <路径> status            # 临时对某个仓库操作
 ```

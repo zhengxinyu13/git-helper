@@ -9,12 +9,14 @@ Git 提交助手 —— 核心逻辑层（纯标准库，无任何 GUI 依赖）
 
 改这里等于同时改两边，不要把 git 逻辑复制到 GUI 里。
 """
+import fnmatch
 import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime
 
@@ -130,7 +132,118 @@ DEFAULT_CONFIG = {
     "blurBackground": True,
     # 玻璃浓度档位：通透 / 标准 / 沉稳 / 实底。壁纸花、累眼时调沉。
     "glassLevel": "沉稳",
+    # 自动提交时跳过「正在写入」的文件（Office 锁文件 / 刚改过还没稳定 /
+    # 云盘正在同步）。关掉就回到原来「add -A 全交」的行为。
+    "skipUnstable": True,
+    # 文件改完后多久算「稳定」。云盘上传 + Office 保存都可能要几十秒。
+    "stableSeconds": 120,
+    # 已经提示过「此仓库在云盘目录里」的路径，避免每次启动都弹一次。
+    "cloudWarnedFor": "",
+    # 关窗口时缩到系统托盘后台运行（定时自动提交照旧生效），而不是直接退出。
+    "minimizeToTray": True,
+    # 开机自启。写的是 HKCU 的 Run 项，不需要管理员权限。
+    "launchAtLogin": False,
 }
+
+
+# ---------------------------------------------------------------- 云盘目录
+# 仓库落在云同步目录里时，git 每写一次 .git 都要触发一轮同步，
+# 云盘也可能在 git 读取的同一瞬间改写工作区文件 —— 两边抢同一批文件。
+# 这里只做「识别 + 提醒 + 提交时保守处理」，不去动用户的云盘设置。
+CLOUD_MARKERS = (
+    ("坚果云", "坚果云"),
+    ("nutstore", "坚果云"),
+    ("onedrive", "OneDrive"),
+    ("dropbox", "Dropbox"),
+    ("icloud", "iCloud"),
+    ("百度网盘", "百度网盘"),
+    ("baidunetdisk", "百度网盘"),
+    ("google drive", "Google Drive"),
+    ("seafile", "Seafile"),
+    ("syncthing", "Syncthing"),
+    ("群晖", "群晖 Drive"),
+)
+
+
+def is_cloud_dir(path):
+    """判断目录是否在已知云同步盘里。返回云盘名称，不在则返回 None。"""
+    if not path:
+        return None
+    low = os.path.abspath(path).lower()
+    for key, label in CLOUD_MARKERS:
+        if key.lower() in low:
+            return label
+    return None
+
+
+# ---------------------------------------------------------------- 忽略规则
+# 自动提交最大的隐患是「垃圾文件也被交进去」：Office 打开文档时生成的 ~$ 锁文件、
+# 各种临时文件、云盘冲突副本。这些文件本来就不该进版本库，所以这里备一份默认清单，
+# 建库时写进 .gitignore，并且提交时再拦一道（已有仓库没写 .gitignore 也照样生效）。
+#
+# 注意：.gitignore 不支持行内 # 注释，「~$*  # 锁文件」这种写法会让整行失效。
+DEFAULT_IGNORES = [
+    "~$*",
+    "*.tmp",
+    "*.temp",
+    "*.bak",
+    "*.swp",
+    "*.crdownload",
+    "*.part",
+    "*.~lock",
+    "__pycache__/",
+    "*.py[cod]",
+    ".DS_Store",
+    "Thumbs.db",
+    "*的冲突副本*",
+    "*conflicted copy*",
+]
+
+IGNORE_BEGIN = "# >>> Git 提交助手：以下由程序维护，可自行增删 >>>"
+IGNORE_END = "# <<< Git 提交助手：以上由程序维护，下面写你自己的规则 <<<"
+
+
+def ensure_gitignore(repo):
+    """保证仓库有一份带默认规则的 .gitignore。返回新增了几条规则。
+
+    - 没有 .gitignore → 整份新建；
+    - 已有但没有助手段落 → 在文件末尾追加一段；
+    - 已有助手段落 → 只补齐缺的规则，不动用户自己写的部分。
+    """
+    path = os.path.join(repo, ".gitignore")
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+
+    try:
+        b, e = lines.index(IGNORE_BEGIN), lines.index(IGNORE_END)
+        block, head, tail = lines[b + 1:e], lines[:b], lines[e + 1:]
+    except ValueError:
+        block, head, tail = [], lines, []
+
+    added = [r for r in DEFAULT_IGNORES if r not in block]
+    block = block + added
+
+    if not head and not tail and not added and block == DEFAULT_IGNORES:
+        return 0                                   # 已是标准状态，不用重写
+
+    out = head + [IGNORE_BEGIN] + block + [IGNORE_END] + tail
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+    return len(added)
+
+
+def is_ignored(rel):
+    """文件名是否命中默认忽略清单（不依赖 .gitignore 是否写全，双保险）。"""
+    base = os.path.basename(rel)
+    for pat in DEFAULT_IGNORES:
+        if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(rel, pat):
+            return True
+    return False
 
 STATUS_LABEL = {
     "??": "新增", "A ": "新增", "AM": "新增",
@@ -222,6 +335,7 @@ def init_repo(path):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
     git(path, "init", "-b", "main")
+    ensure_gitignore(path)          # 先立规矩，再 add，垃圾文件才不会进首次提交
     git(path, "add", "-A")
     if has_staged(path):
         git(path, "commit", "-m", "chore: 初始化仓库，纳入现有文件")
@@ -322,16 +436,147 @@ def get_log(repo, limit=200):
     return rows
 
 
-def do_commit(repo, message=None, paths=None):
+def unstable_reason(repo, rel, stable_seconds=None):
+    """这个文件现在能不能安全提交。返回 None = 可以，否则返回跳过原因。
+
+    三种情况不交：
+      1. Office/WPS 打开文档时生成的 ~$xxx 锁文件（临时文件，本就不该入库）；
+      2. 同目录里有 ~$ 开头、名字能对上的锁文件 —— 说明文档正开着，
+         用户可能还在改，此时提交的是半成品；
+      3. 文件最后修改时间距今太近（默认 120 秒）—— 云盘可能还没同步完，
+         也可能用户下一秒还要保存。
+    """
+    base = os.path.basename(rel)
+    if base.startswith("~$"):
+        return "Office 临时锁文件"
+    if base == ".gitignore":
+        return None          # 程序自己刚写好的规则文件，写完即稳定，不用等
+    secs = DEFAULT_CONFIG["stableSeconds"] if stable_seconds is None else stable_seconds
+    full = os.path.join(repo, rel)
+    # 已删除的文件不在磁盘上，删掉是明确动作，不该被"稳定性"拦住
+    if not os.path.exists(full):
+        return None
+    try:
+        age = time.time() - os.path.getmtime(full)
+    except OSError:
+        return None
+    if age < secs:
+        return "刚改动 %d 秒" % int(age)
+    d = os.path.dirname(full) or repo
+    try:
+        for n in os.listdir(d):
+            if n.startswith("~$") and base.startswith(n[2:]):
+                return "文件正被 Office 打开"
+    except OSError:
+        pass
+    return None
+
+
+def filter_stable(repo, files, stable_seconds=None):
+    """把待提交列表拆成「可交」和「跳过」两部分。"""
+    kept, skipped = [], []
+    for f in files:
+        reason = unstable_reason(repo, f["path"], stable_seconds)
+        if reason:
+            skipped.append({"status": f["status"], "path": f["path"],
+                            "reason": reason})
+        else:
+            kept.append(f)
+    return kept, skipped
+
+
+# ---------------------------------------------------------------- 开机自启
+# 写在 HKCU（当前用户）下，不需要管理员权限，也不会影响别的账号。
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "Git 提交助手"
+
+
+def _exe_path():
+    """开机自启要启动的那个程序路径。源码模式返回 None（不给 Python 脚本登记）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return None
+
+
+def get_launch_at_login():
+    """读注册表里有没有登记开机自启。读不到就当没开。"""
+    if platform.system() != "Windows":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, RUN_NAME)
+            return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def set_launch_at_login(enable):
+    """登记 / 取消开机自启。返回是否真的改成了。"""
+    if platform.system() != "Windows":
+        return False
+    import winreg
+    exe = _exe_path()
+    if not exe:
+        return False
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            if enable:
+                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ,
+                                  '"%s"' % os.path.normpath(exe))
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_NAME)
+                except OSError:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def _add_paths(repo, paths, batch=200):
+    """分批 add，避免文件过多时命令行超长（Windows 上限约 3.2 万字符）。"""
+    for i in range(0, len(paths), batch):
+        git(repo, "add", "-A", "--", *paths[i:i + batch])
+
+
+def do_commit(repo, message=None, paths=None, skip_unstable=True):
+    """提交。返回 (hash, 提交说明, 被跳过的文件列表)。
+
+    hash 为 None 表示这次没提交成（无变更，或变更都还在写入中）。
+    """
+    _, files = get_status(repo)
     if paths:
-        git(repo, "add", "-A", "--", *paths)
-    else:
-        git(repo, "add", "-A")
+        wanted = set(paths)
+        files = [f for f in files if f["path"] in wanted]
+
+    kept, skipped = files, []
+    # 1) 忽略规则优先：不管 .gitignore 有没有写全，这类文件一律不进版本库
+    blocked = [f for f in kept if is_ignored(f["path"])]
+    if blocked:
+        bp = {f["path"] for f in blocked}
+        kept = [f for f in kept if f["path"] not in bp]
+        skipped += [{"status": f["status"], "path": f["path"],
+                     "reason": "默认忽略规则"} for f in blocked]
+    # 2) 再看文件是不是还在写入中
+    if skip_unstable:
+        kept, s2 = filter_stable(repo, kept)
+        skipped += s2
+
+    if not kept:
+        if skipped:
+            return None, "%d 个文件仍在写入中，本次跳过" % len(skipped), skipped
+        return None, "没有需要提交的变更", skipped
+
+    _add_paths(repo, [f["path"] for f in kept])
     if not has_staged(repo):
-        return None, "没有需要提交的变更"
+        return None, "没有需要提交的变更", skipped
     msg = (message or "").strip() or "chore: 自动提交 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     git(repo, "commit", "-m", msg)
-    return git(repo, "rev-parse", "HEAD").strip(), msg
+    return git(repo, "rev-parse", "HEAD").strip(), msg, skipped
 
 
 def create_backup(repo):

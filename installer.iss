@@ -7,12 +7,18 @@
 ;       脚本会在安装完成后检测，没装就弹提示（不阻断安装）。
 
 #define MyAppName "Git 提交助手"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Grayson Zheng"
 #define MyAppExeName "Git提交助手.exe"
 #define MyCliExeName "GitHelper-CLI.exe"
 ; AppId 必须永远不变：升级时靠它认出旧版本，改了就会装成第二份
 #define MyAppId "{967E7D85-8020-42D6-8F0B-866FA354AB62}"
+
+; Git for Windows 安装包（本机没装 Git 时，安装助手可顺便联网下载安装）。
+; 版本号 / 下载地址由 build_exe.py 在打包时自动刷新为最新稳定版；
+; 这里留一个真实可用的默认值，手工 ISCC 也能编译。
+#define GIT_VERSION "2.56.0.windows.4"
+#define GIT_SETUP_URL "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/Git-2.56.0.4-64-bit.exe"
 
 [Setup]
 AppId={{#MyAppId}
@@ -124,6 +130,13 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "安装完成后立即启动 Git 提交助手"; \
     Flags: nowait postinstall skipifsilent unchecked
+; 本机没装 Git 且用户在「Git 安装」页勾选了 → 静默安装 Git for Windows。
+; 文件由 NextButtonClick 阶段联网下载到 {tmp}，这里只负责跑它。
+; 参数：/VERYSILENT 不弹 UI，/NORESTART 不重启，/NOCANCEL 不让用户中途取消。
+Filename: "{tmp}\GitSetup.exe"; Parameters: "/VERYSILENT /NORESTART /NOCANCEL"; \
+    Description: "正在安装 Git for Windows…"; \
+    StatusMsg: "正在安装 Git for Windows，请稍候…"; \
+    Flags: runhidden; Check: GitShouldInstall
 
 [UninstallDelete]
 ; 只清理旧版本（<=1.0.3）遗留在程序目录里的运行时文件。
@@ -134,6 +147,12 @@ Type: files; Name: "{app}\error.log"
 [Code]
 var
   OldVersion: string;
+  GitPage: TInputOptionWizardPage;
+
+{ 前向声明：下面这些函数在 InitializeWizard / NextButtonClick 里被提前调用，
+  但定义放在更后面，所以这里先声明 }
+function GitInstalled(): Boolean; forward;
+function DownloadGit(): Boolean; forward;
 
 function InstalledVersion(): string;
 begin
@@ -176,6 +195,99 @@ begin
     if Pos('桌面', WizardForm.TasksList.ItemCaption[i]) > 0 then
       WizardForm.TasksList.Checked[i] := not DesktopIconExists();
   end;
+
+  { 本机没装 Git：在「选择附加任务」页之后插一页，让用户决定是否顺便安装。
+    默认勾选；用户取消也可以，软件打开后会用常驻横幅提示先装 Git。 }
+  if not GitInstalled() then
+  begin
+    GitPage := CreateInputOptionPage(wpSelectTasks,
+      'Git for Windows 未安装',
+      'Git 提交助手依赖 Git 命令',
+      'Git 提交助手是 git 的图形外壳，必须先装 Git 才能用。' + #13#10 +
+      '建议勾选下面一项，安装时会联网下载并静默安装 Git for Windows（约 60MB）。' + #13#10 +
+      '取消勾选也可以，之后你随时能自己装，软件打开后会提示你。',
+      True, False);
+    GitPage.Add('为这台电脑安装 Git for Windows（软件运行所必需）');
+    GitPage.Values[0] := True;
+  end;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  { 离开 Git 安装页、且用户勾选了 → 联网下载安装程序到临时目录（只下这一次） }
+  if (GitPage <> nil) and (CurPageID = GitPage.ID) and GitPage.Values[0] then
+  begin
+    if not FileExists(ExpandConstant('{tmp}\GitSetup.exe')) then
+    begin
+      if not DownloadGit() then
+      begin
+        if MsgBox('下载 Git 安装程序失败，可能是网络问题。' + #13#10 +
+                  '你可以稍后手动安装 Git for Windows：' + #13#10 +
+                  '    https://git-scm.com/download/win' + #13#10 + #13#10 +
+                  '仍要继续安装 Git 提交助手吗？（之后软件会提示你先装 Git）',
+                  mbConfirmation, MB_YESNO) = IDNO then
+          Result := False;
+      end;
+    end;
+  end;
+end;
+
+function DownloadGit(): Boolean;
+var
+  URL, Dest, Params: string;
+  ErrCode: Integer;
+  ProgressPage: TOutputProgressWizardPage;
+begin
+  Result := False;
+  URL := '{#GIT_SETUP_URL}';
+  Dest := ExpandConstant('{tmp}\GitSetup.exe');
+  ProgressPage := CreateOutputProgressPage('正在下载 Git for Windows',
+    '请稍候，正在下载约 60MB 的安装程序（只需这一次）…');
+  ProgressPage.SetProgress(0, 100);
+  ProgressPage.Show();
+  try
+    Params := '-NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri ' +
+              '''' + URL + '''' + ' -OutFile ' + '''' + Dest + '''' +
+              ' -UseBasicParsing"';
+    if Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ErrCode) then
+      Result := (ErrCode = 0) and FileExists(Dest);
+  finally
+    ProgressPage.Hide();
+    ProgressPage.Free();
+  end;
+end;
+
+function GitShouldInstall(): Boolean;
+begin
+  Result := (GitPage <> nil) and GitPage.Values[0] and
+            FileExists(ExpandConstant('{tmp}\GitSetup.exe'));
+end;
+
+procedure RegisterGitPath();
+var
+  GitCmd, PathVar: string;
+begin
+  { 把 Git 的 cmd 目录追加进用户级 PATH，这样命令行版和终端也能直接敲 git。
+    Git 静默安装不一定会写 PATH（尤其 per-user 安装），这里补齐。 }
+  GitCmd := '';
+  if FileExists(ExpandConstant('{localappdata}\Programs\Git\cmd\git.exe')) then
+    GitCmd := ExpandConstant('{localappdata}\Programs\Git\cmd')
+  else if FileExists(ExpandConstant('{pf}\Git\cmd\git.exe')) then
+    GitCmd := ExpandConstant('{pf}\Git\cmd')
+  else if FileExists(ExpandConstant('{pf32}\Git\cmd\git.exe')) then
+    GitCmd := ExpandConstant('{pf32}\Git\cmd');
+  if GitCmd = '' then
+    exit;
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', PathVar) then
+    PathVar := '';
+  if Pos(';' + Uppercase(GitCmd) + ';', ';' + Uppercase(PathVar) + ';') > 0 then
+    exit;
+  if PathVar = '' then
+    PathVar := GitCmd
+  else
+    PathVar := PathVar + ';' + GitCmd;
+  RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', PathVar);
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -217,13 +329,22 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if (CurStep = ssPostInstall) and (not GitInstalled()) then
-    MsgBox('没有在这台电脑上检测到 Git。' + #13#10 + #13#10 +
-           'Git 提交助手是 git 的图形外壳，所有功能都依赖 git 命令。' + #13#10 +
-           '请先安装 Git for Windows（一路下一步即可）：' + #13#10 +
-           '    https://git-scm.com/download/win' + #13#10 + #13#10 +
-           '装完 Git 后再打开本助手就能正常工作。',
-           mbInformation, MB_OK);
+  if CurStep = ssPostInstall then
+  begin
+    { 用户勾选了顺带装 Git → 把 Git 的 cmd 目录补进用户 PATH }
+    if GitShouldInstall() then
+      RegisterGitPath();
+
+    { 只有当用户没选装、且仍检测不到 Git 时，才弹提示（选了但下载/安装失败的情况，
+      软件打开后会有常驻横幅兜底，这里不再重复打扰） }
+    if (not GitInstalled()) and ((GitPage = nil) or (not GitPage.Values[0])) then
+      MsgBox('没有在这台电脑上检测到 Git。' + #13#10 + #13#10 +
+             'Git 提交助手是 git 的图形外壳，所有功能都依赖 git 命令。' + #13#10 +
+             '请先安装 Git for Windows（一路下一步即可）：' + #13#10 +
+             '    https://git-scm.com/download/win' + #13#10 + #13#10 +
+             '装完 Git 后再打开本助手就能正常工作。',
+             mbInformation, MB_OK);
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

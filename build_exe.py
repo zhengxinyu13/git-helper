@@ -10,9 +10,13 @@
     <venv>\\Scripts\\python.exe build_exe.py
 """
 import os
+import re
+import json
+import ssl
 import shutil
 import subprocess
 import sys
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ICON = os.path.join(HERE, "app.ico")
@@ -52,7 +56,41 @@ def run(name, script, windowed):
     return True
 
 
+def refresh_git_url():
+    """打包前把 installer.iss 里的 Git 下载地址刷新成 Git for Windows 最新稳定版。
+
+    best-effort：代理环境下可能拉不到，失败就保留文件里既有的默认值，
+    不影响正常打包（默认值本身也是真实可下载的）。
+    """
+    iss = os.path.join(HERE, "installer.iss")
+    if not os.path.isfile(iss):
+        return
+    api = "https://api.github.com/repos/git-for-windows/git/releases/latest"
+    try:
+        req = urllib.request.Request(
+            api, headers={"User-Agent": "git-helper-build"})
+        # 绕过沙箱代理，直连 GitHub
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=20) as r:
+            data = json.load(r)
+        url = next((a["browser_download_url"] for a in data.get("assets", [])
+                    if a["name"].endswith("64-bit.exe")), None)
+        if not url:
+            return
+        ver = re.sub(r"^v", "", data.get("tag_name", ""))
+        txt = open(iss, encoding="utf-8").read()
+        txt = re.sub(r'(?m)^#define GIT_VERSION ".*"',
+                     '#define GIT_VERSION "%s"' % ver, txt)
+        txt = re.sub(r'(?m)^#define GIT_SETUP_URL ".*"',
+                     '#define GIT_SETUP_URL "%s"' % url, txt)
+        open(iss, "w", encoding="utf-8").write(txt)
+        print("已刷新 Git 下载地址 -> %s" % ver)
+    except Exception as e:
+        print("（跳过）刷新 Git 下载地址失败：%s" % e)
+
+
 def main():
+    refresh_git_url()
     if not os.path.exists(ICON):
         print("缺少图标 %s，先跑 make_icon.py" % ICON)
         return 1

@@ -298,8 +298,46 @@ def remember_repo(cfg, path):
 CREATE_NO_WINDOW = 0x08000000
 
 
+_GIT_EXE = None  # 缓存解析到的 git 可执行文件绝对路径
+
+
+def _resolve_git():
+    """找到 git 可执行文件。优先用 PATH，其次查常见安装位置。
+
+    为什么要查常见位置：安装助手时我们可能刚把 Git 静默装好，但它未必写进了
+    当前进程的 PATH（尤其 per-user 安装）。只要 git.exe 在下面任一位置存在，
+    就算没进 PATH 也能用，界面就不会误报「没装 Git」。
+    """
+    global _GIT_EXE
+    if _GIT_EXE is not None:
+        # 之前解析过：若被卸载/移动就失效，重新探测
+        return _GIT_EXE if os.path.exists(_GIT_EXE) else None
+    candidate = shutil.which("git")
+    if candidate:
+        _GIT_EXE = os.path.abspath(candidate)
+        return _GIT_EXE
+    locs = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git",
+                     "cmd", "git.exe"),
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+        r"C:\Git\cmd\git.exe",
+    ]
+    for c in locs:
+        if c and os.path.exists(c):
+            _GIT_EXE = c
+            return _GIT_EXE
+    return None
+
+
+def git_available():
+    """本机是否装了可用的 git（供界面判断是否该显示「未检测到 Git」横幅）。"""
+    return _resolve_git() is not None
+
+
 def _run(repo, *args):
-    cmd = ["git", "-c", "core.quotepath=false", "-c", "core.safecrlf=false", *args]
+    exe = _resolve_git() or "git"
+    cmd = [exe, "-c", "core.quotepath=false", "-c", "core.safecrlf=false", *args]
     kwargs = {}
     if platform.system() == "Windows":
         # 双保险：CREATE_NO_WINDOW 抑制控制台分配，

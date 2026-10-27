@@ -14,10 +14,10 @@ import os
 import sys
 
 from PyQt6.QtCore import (QDateTime, QPoint, QRect, QRectF, QObject, QRunnable,
-                          Qt, QThreadPool, QTimer, pyqtSignal)
+                          Qt, QThreadPool, QTimer, pyqtSignal, QUrl)
 from PyQt6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient,
-                         QIcon, QFontDatabase)
+                         QIcon, QFontDatabase, QDesktopServices)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                              QComboBox, QDialog, QFileDialog, QFrame,
                              QGraphicsBlurEffect,
@@ -30,8 +30,9 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 from gitcore import (CREDIT, DEFAULT_REPO, ERROR_LOG, RES, create_backup,
                      create_branch, delete_branch, discard_all, do_commit,
                      get_branches, get_diff, get_log, get_status, git,
-                     ensure_gitignore, get_launch_at_login, init_repo,
-                     is_cloud_dir, is_repo, load_config, log_exception,
+                     ensure_gitignore, get_launch_at_login, git_available,
+                     init_repo, is_cloud_dir, is_repo, load_config,
+                     log_exception,
                      merge_branch, abort_merge, remember_repo, reset_to,
                      restore_file, revert_commit, save_config,
                      set_launch_at_login, switch_branch)
@@ -107,6 +108,13 @@ QLabel#chipWarn {{
     border-radius: 8px;
     padding: 2px 8px;
     font-size: 8pt;
+}}
+QLabel#gitWarn {{
+    color: #ffffff;
+    background: rgba(214, 69, 53, 0.92);
+    border-radius: 10px;
+    padding: 7px 10px;
+    font-size: 10pt;
 }}
 QLabel#groupTitle {{
     color: {muted};
@@ -594,6 +602,7 @@ class GlassWindow(QWidget):
         self._build_ui()
         self._wire_timers()
         self._mark_cloud()
+        self._check_git()                  # 没装 Git 就显示横幅并禁用操作区
 
         # 同一仓库上的 git 操作必须串行：两个 git 同时写 .git 会互相踩
         # （典型后果是 index.lock 报错、提交丢一半）。所以池子里只留 1 条线程。
@@ -945,10 +954,63 @@ class GlassWindow(QWidget):
         outer.setSpacing(8)
 
         outer.addLayout(self._build_titlebar())
-        outer.addLayout(self._build_reporow())
-        outer.addLayout(self._build_branchrow())
-        outer.addLayout(self._build_body(), 1)
+        # 未检测到 Git 时的常驻横幅（默认隐藏，由 _check_git 控制显隐）
+        self._banner = self._build_git_banner()
+        outer.addWidget(self._banner)
+        self._layout_repo = self._build_reporow()
+        outer.addLayout(self._layout_repo)
+        self._layout_branch = self._build_branchrow()
+        outer.addLayout(self._layout_branch)
+        self._layout_body = self._build_body()
+        outer.addLayout(self._layout_body, 1)
         outer.addLayout(self._build_statusbar())
+
+    def _build_git_banner(self):
+        """顶部常驻警示条：本机没装 Git 时显示，写明功能停用并给下载入口。"""
+        box = QWidget()
+        box.setObjectName("gitWarnBox")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(10, 8, 10, 8)
+        lab = QLabel("⚠ 未检测到 Git，所有功能已停用。Git 提交助手是 git 的图形外壳，"
+                     "必须先安装 Git for Windows 才能工作。")
+        lab.setObjectName("gitWarn")
+        lab.setWordWrap(True)
+        row.addWidget(lab, 1)
+        btn = QPushButton("前往下载 Git")
+        btn.setObjectName("accent")
+        btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl("https://git-scm.com/download/win")))
+        row.addWidget(btn)
+        self._banner_btn = btn
+        box.setVisible(False)
+        return box
+
+    def _set_layout_enabled(self, layout, enabled):
+        """递归地启用 / 禁用一个布局里的所有控件。"""
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                w.setEnabled(enabled)
+            sub = item.layout()
+            if sub is not None:
+                self._set_layout_enabled(sub, enabled)
+
+    def _set_git_enabled(self, ok):
+        """Git 可用时启用全部操作区；不可用时禁用并弹出横幅。"""
+        for lay in (self._layout_repo, self._layout_branch, self._layout_body):
+            self._set_layout_enabled(lay, ok)
+        self._banner.setVisible(not ok)
+        if ok:
+            if self.lbl_chip.text() == "未检测到 Git":
+                self.lbl_chip.setText("—")
+        else:
+            self.lbl_chip.setText("未检测到 Git")
+
+    def _check_git(self):
+        """根据 git 是否可用刷新横幅与控件启用状态（可反复调用）。"""
+        self._set_git_enabled(git_available())
 
     def _build_titlebar(self):
         bar = QHBoxLayout()
@@ -1577,6 +1639,11 @@ class GlassWindow(QWidget):
 
     # ------------------------------------------------------------ 刷新
     def refresh(self):
+        # Git 不可用：保持横幅 + 禁用状态，不再去调 git 命令（否则只会弹报错框）
+        if not git_available():
+            self._set_git_enabled(False)
+            return
+        self._set_git_enabled(True)
         if not is_repo(self.repo):
             self.clear_views()
             self.lbl_chip.setText("未初始化")
@@ -1841,6 +1908,8 @@ class GlassWindow(QWidget):
         self.auto_tick()
 
     def auto_tick(self):
+        if not git_available():
+            return
         if not (self.cfg.get("autoEnabled") and is_repo(self.repo)):
             return
         now_ms = QDateTime.currentMSecsSinceEpoch()
